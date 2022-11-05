@@ -164,9 +164,11 @@ module Dependencies =
         /// Regression test for cycles created from body dependencies
         [<Fact>]
         let ``no dependencies when the same body is used in unrelated requests`` () =
+            let outputDirectory = ctx.testRootDirPath
+                             
             let config = { Restler.Config.SampleConfig with
                              IncludeOptionalParameters = true
-                             GrammarOutputDirectoryPath = Some ctx.testRootDirPath
+                             GrammarOutputDirectoryPath = Some outputDirectory
                              ResolveBodyDependencies = true
                              UseBodyExamples = Some true
                              SwaggerSpecFilePath = Some [(Path.Combine(Environment.CurrentDirectory, @"swagger\dependencyTests\body_dependency_cycles.json"))]
@@ -177,7 +179,7 @@ module Dependencies =
 
             // Read the dependencies.json and check that there are 3 producer-consumer dependencies.
             let dependencies =
-                let dependenciesJsonFilePath = Path.Combine(ctx.testRootDirPath,
+                let dependenciesJsonFilePath = Path.Combine(outputDirectory,
                                                             Restler.Workflow.Constants.DependenciesDebugFileName)
 
                 Microsoft.FSharpLu.Json.Compact.deserializeFile<ProducerConsumerDependency list> dependenciesJsonFilePath
@@ -334,7 +336,7 @@ module Dependencies =
                                                Restler.Workflow.Constants.DefaultRestlerGrammarFileName)
             let grammar = File.ReadAllText(grammarFilePath)
 
-            Assert.True(grammar.Contains("""restler_custom_payload_uuid4_suffix("fileId", writer=_file__fileId__post_fileId_path.writer())"""))
+            Assert.True(grammar.Contains("""restler_custom_payload_uuid4_suffix("fileId", writer=_file__fileId__post_fileId_path.writer(), quoted=False)"""))
             Assert.True(grammar.Contains("""restler_static_string(_file__fileId__post_fileId_path.reader(), quoted=False)"""))
 
             // Validate (tag, label) annotation.  tag - body producer (jsonpath), label: path parameter.
@@ -520,6 +522,34 @@ module Dependencies =
             let readers = grammarLines |> Array.filter (fun line -> line.Contains(".reader()"))
             let message = sprintf "Grammar contains %d readers, expected 1" readers.Length
             Assert.True((readers.Length = 1), message)
+
+
+        /// Test the case when a dynamic object reader is also a writer for a different variable
+        [<Fact>]
+        let ``reader and writer with annotations`` () =
+            let grammarOutputDirPath = ctx.testRootDirPath
+
+            for annotationTest in ["1"; "2"] do
+                let config = { Restler.Config.SampleConfig with
+                                 IncludeOptionalParameters = true
+                                 GrammarOutputDirectoryPath = Some grammarOutputDirPath
+                                 SwaggerSpecFilePath = Some [(Path.Combine(Environment.CurrentDirectory, @"swagger\dependencyTests\simple_api_soft_delete.json"))]
+                                 CustomDictionaryFilePath = None
+                                 AnnotationFilePath = Some (Path.Combine(Environment.CurrentDirectory, sprintf @"swagger\dependencyTests\simple_api_soft_delete_annotations%s.json" annotationTest))
+                                 AllowGetProducers = true
+                                 ResolveQueryDependencies = true
+                             }
+                Restler.Workflow.generateRestlerGrammar None config
+
+                let actualGrammarFilePath = Path.Combine(grammarOutputDirPath,
+                                                         Restler.Workflow.Constants.DefaultRestlerGrammarFileName)
+                let expectedGrammarFilePath = Path.Combine(Environment.CurrentDirectory,
+                                                           sprintf @"baselines\dependencyTests\soft_delete_test_grammar%s.py" annotationTest)
+
+                let grammarDiff = getLineDifferences expectedGrammarFilePath actualGrammarFilePath
+                let message = sprintf "Grammar for annotation test %s does not match baseline.  First difference: %A" annotationTest grammarDiff
+                Assert.True(grammarDiff.IsNone, message)
+
 
         interface IClassFixture<Fixtures.TestSetupAndCleanup>
 

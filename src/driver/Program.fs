@@ -14,7 +14,7 @@ open Microsoft.FSharpLu.Diagnostics.Process
 open Restler.Telemetry
 
 [<Literal>]
-let CurrentVersion = "8.5.0"
+let CurrentVersion = "9.1.0"
 let EngineErrorCode = -2
 
 let exitRestler status =
@@ -26,6 +26,7 @@ let usage() =
         "Usage:
 
   restler --version
+          generate_config --specs <OpenAPI file list or directory> --output_dir <output directory>
           [--disable_log_upload] [--logsUploadRootDirPath <log upload directory>]
           [--python_path <full path to python executable>]
           [--workingDirPath <local logs directory (default: cwd)>]
@@ -79,7 +80,7 @@ let usage() =
             all the checkers below except namespacerule.
             Supported checkers: leakagerule, resourcehierarchy, useafterfree,
                                 namespacerule, invaliddynamicobject, payloadbody,
-                                examples.
+                                examples, invalidvalue
 
         --no_results_analyzer
             If specified, do not run results analyzer on the network logs.
@@ -146,7 +147,7 @@ module Compile =
             { config with
                 GrammarOutputDirectoryPath = Some compilerOutputDirPath
                 CustomDictionaryFilePath = dictionaryFilePath }
-        let compilerConfigPath = workingDirectory ++ "config.json"
+        let compilerConfigPath = workingDirectory ++ Restler.Workflow.Constants.DefaultCompilerConfigName
         Microsoft.FSharpLu.Json.Compact.serializeToFile compilerConfigPath compilerConfig
 
         // Run compiler
@@ -179,6 +180,7 @@ module Fuzz =
             "invaliddynamicobject"
             "payloadbody"
             "examples"
+            "invalidvalue"
             "*"
         ]
 
@@ -443,6 +445,127 @@ let getCheckerOptions defaultCheckerOptions userSpecifiedCheckerOptions =
             usage()
     engineCheckerOptions
 
+
+module Config =
+    open Newtonsoft.Json.Linq
+
+    type GenerateConfigParameters =
+        {
+            specFilesOrDirs : string list
+            outputDir : string option
+        }
+
+    let rec parseGenerateConfigParameters (args:GenerateConfigParameters) = function
+        | [] ->
+            if args.specFilesOrDirs.Length = 0 then
+                Logging.logError <| sprintf "At least one specification file or directory must be specified."
+                usage()
+
+            { args with
+                outputDir = match args.outputDir with
+                            | Some d -> Some d
+                            | None -> Some (Environment.CurrentDirectory ++ "restlerConfig") }
+        | "--output_dir"::outputDir::rest ->
+            let absPath = Restler.Config.convertToAbsPath Environment.CurrentDirectory outputDir
+            parseGenerateConfigParameters { args with outputDir = Some absPath } rest
+        | "--specs"::rest ->
+            let nextArgIndex =
+                rest |> Seq.tryFindIndex (fun x -> x.StartsWith("--"))
+            let specs, rest =
+                match nextArgIndex with
+                | None ->
+                    rest, []
+                | Some i ->
+                    rest.[0..i-1], (rest |> List.skip i)
+
+            parseGenerateConfigParameters { args with specFilesOrDirs = specs } rest
+        | invalidArgument::rest ->
+            Logging.logError <| sprintf "Invalid argument: %s" invalidArgument
+            usage()
+
+    let generateConfig (generateConfigParameters:string list) =
+        // If the config directory path is specified, it will be the last two entries
+        // in the list
+        let configParameters = parseGenerateConfigParameters
+                                    { specFilesOrDirs = []
+                                      outputDir = None }
+                                    generateConfigParameters
+        let configDirPath = configParameters.outputDir.Value
+        printf "Creating directory %s" configDirPath
+        createDirIfNotExists configDirPath
+        let specPaths =
+            configParameters.specFilesOrDirs
+            |> Seq.distinct
+            |> Seq.map (fun specFileOrDir ->
+                if File.Exists specFileOrDir then
+                    [ specFileOrDir ]
+                elif (Directory.Exists specFileOrDir) then
+                    // Assume the specifications are either yaml or json
+                    let fileExtensions = [".json"; ".yml"; ".yaml"]
+                    fileExtensions
+                    |> Seq.map (fun ext ->
+                                    Directory.GetFiles(specFileOrDir, sprintf "*%s" ext)
+                                    |> seq)
+                    |> Seq.concat
+                    |> Seq.toList
+                else
+                    Logging.logError <| sprintf "API specification file or directory %s does not exist." specFileOrDir
+                    usage())
+            |> Seq.concat
+
+        // Get absolute paths.  The user will need to convert these to a relative path
+        // when checked in.
+        let swaggerSpecAbsFilePaths =
+            specPaths
+            |> Seq.map (fun filePath ->
+                            Restler.Config.convertToAbsPath Environment.CurrentDirectory filePath)
+            |> Seq.toList
+        let dictionaryFileName = "dict.json"
+        let dictionaryFilePath = configDirPath ++ dictionaryFileName
+        let customPayloads = """{
+            "restler_custom_payload": {},
+            "restler_custom_payload_header": {},
+            "restler_custom_payload_query": {},
+            "restler_custom_payload_uuid4_suffix": {}
+        }"""
+        let defaultDictionary =
+            match Restler.Dictionary.getDictionaryFromString customPayloads with
+            | Ok d ->
+                Microsoft.FSharpLu.Json.Compact.serializeToFile dictionaryFilePath d
+            | error ->
+                failwith "Could not deserialize default dictionary during generate_config."
+        let engineSettingsFilePath = configDirPath ++ Restler.Workflow.Constants.DefaultEngineSettingsFileName
+
+        let updateEngineSettingsResult = Restler.Engine.Settings.updateEngineSettings
+                                               [] (Map.empty<string, string>) None configDirPath engineSettingsFilePath
+        match updateEngineSettingsResult with
+        | Ok () -> ()
+        | Error message ->
+            printfn "%s" message
+            exit 1
+
+        let annotationFilePath = configDirPath ++ Restler.Workflow.Constants.DefaultAnnotationFileName
+        File.WriteAllText(annotationFilePath, Restler.Annotations.Constants.EmptyAnnotationFile)
+
+        // Add the dictionary, annotations, and engine settings.
+        // In order to generate only the properties required to set the config files,
+        // use a JObject below instead of modifying the default config.
+        let config =
+            JObject(
+                JProperty("SwaggerSpecFilePath", JArray(swaggerSpecAbsFilePaths)),
+                JProperty("DataFuzzing", true),
+                JProperty("CustomDictionaryFilePath", Restler.Workflow.Constants.NewDictionaryFileName),
+                JProperty("EngineSettingsFilePath", Restler.Workflow.Constants.DefaultEngineSettingsFileName),
+                JProperty("AnnotationFilePath", Restler.Workflow.Constants.DefaultAnnotationFileName)
+            )
+        // Serialize the config to the specified directory
+        let configFilePath = configDirPath ++ Restler.Workflow.Constants.DefaultCompilerConfigName
+        // Deserialize the config to make sure it is valid before writing it.
+        let defaultConfig = config.ToString()
+        let _ = Microsoft.FSharpLu.Json.Compact.deserialize<Restler.Config.Config> defaultConfig
+        File.WriteAllText(configFilePath, defaultConfig)
+        ()
+
 let rec parseEngineArgs task (args:EngineParameters) = function
     | [] ->
         // Check for unspecified parameters
@@ -560,6 +683,9 @@ let rec parseArgs (args:DriverArgs) = function
     | "--version"::_ ->
         printfn "RESTler version: %s" CurrentVersion
         exit 0
+    | "generate_config"::rest ->
+        Config.generateConfig rest
+        exit 0
     | "--disable_log_upload"::rest ->
         Logging.logWarning "Log upload will be disabled.  Logs will only be written locally in the working directory."
         parseArgs { args with logsUploadRootDirectoryPath = None } rest
@@ -601,21 +727,8 @@ let rec parseArgs (args:DriverArgs) = function
 
         match Microsoft.FSharpLu.Json.Compact.tryDeserializeFile<Restler.Config.Config> compilerConfigFilePath with
         | Choice1Of2 config->
+            let config = Restler.Config.mergeWithDefaultConfig (File.ReadAllText compilerConfigFilePath)
             let config = Restler.Config.convertRelativeToAbsPaths compilerConfigFilePath config
-            let config = { config with
-                                UseQueryExamples = if config.UseQueryExamples.IsSome then
-                                                       config.UseQueryExamples
-                                                   else Restler.Config.DefaultConfig.UseQueryExamples
-                                UseBodyExamples = if config.UseBodyExamples.IsSome then
-                                                      config.UseBodyExamples
-                                                  else Restler.Config.DefaultConfig.UseBodyExamples
-                                UseHeaderExamples = if config.UseHeaderExamples.IsSome then
-                                                      config.UseHeaderExamples
-                                                    else Restler.Config.DefaultConfig.UseHeaderExamples
-                                UsePathExamples = if config.UsePathExamples.IsSome then
-                                                      config.UsePathExamples
-                                                    else Restler.Config.DefaultConfig.UsePathExamples
-                                }
             parseArgs { args with task = Compile ; taskParameters = CompilerParameters config } rest
         | Choice2Of2 error ->
             Logging.logError <| sprintf "Invalid format for compiler config file %s. \
@@ -676,6 +789,7 @@ let getDataFromTestingSummary taskWorkingDirectory =
                 Microsoft.FSharpLu.Json.Compact.deserializeFile<Engine.TestingSummary> testingSummaryFilePath
 
             Logging.logInfo <| sprintf "Request coverage (successful / total): %s" testingSummary.final_spec_coverage
+            Logging.logInfo <| sprintf "Attempted requests: %s" testingSummary.rendered_requests
 
             let bugBuckets = testingSummary.bug_buckets
                                 |> Seq.map (fun kvp -> kvp.Key, sprintf "%A" kvp.Value)
@@ -733,12 +847,6 @@ let tryRecreateDir dirPath =
 
 [<EntryPoint>]
 let main argv =
-    let logsDirPath = Environment.CurrentDirectory ++ "RestlerLogs"
-    tryRecreateDir logsDirPath
-
-    use tracing = System.Diagnostics.Listener.registerFileTracer
-                        "restler"
-                        (Some logsDirPath)
 
     Console.CancelKeyPress.Add(fun arg ->
                                     Trace.info "Ctrl-C intercepted. Long running tasks should have exited. Uploading logs."
@@ -750,7 +858,7 @@ let main argv =
 
     let logShareDirPath = getConfigValue LogCollection.RestlerLogShareSettingsKey
 
-    let args = parseArgs { outputDirPath = logsDirPath
+    let args = parseArgs {
                            task = Compile
                            taskParameters = Undefined
                            workingDirectoryPath = Environment.CurrentDirectory
@@ -758,6 +866,13 @@ let main argv =
                            pythonFilePath = None
                          }
                          (argv |> Array.toList)
+
+    let logsDirPath = args.workingDirectoryPath ++ "RestlerLogs"
+    tryRecreateDir logsDirPath
+
+    use tracing = System.Diagnostics.Listener.registerFileTracer
+                        "restler"
+                        (Some logsDirPath)
 
     // Instrumentation key is from the app insights resource in Azure Portal
     let instrumentationKey =

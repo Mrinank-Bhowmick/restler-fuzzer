@@ -21,6 +21,7 @@ from engine.fuzzing_parameters.body_schema import BodySchema
 from engine.fuzzing_parameters.parameter_schema import QueryList
 from engine.fuzzing_parameters.parameter_schema import HeaderList
 import engine.fuzzing_parameters.param_combinations as param_combinations
+from engine.fuzzing_parameters.fuzzing_config import FuzzingConfig
 
 from engine.errors import InvalidDictionaryException
 import utils.logger as logger
@@ -29,6 +30,8 @@ import engine.dependencies as dependencies
 import engine.mime.multipart_formdata as multipart_formdata
 from enum import Enum
 from engine.transport_layer import messaging
+from urllib.parse import quote_plus as url_quote_plus
+
 
 class EmptyRequestException(Exception):
     pass
@@ -255,6 +258,7 @@ class Request(object):
         self._create_once_requests = []
         self._tracked_parameters = {}
         self._rendered_values_cache = RenderedValuesCache()
+        self._last_rendered_schema_request = None
 
         # Check for empty request before assigning ids
         if self._definition:
@@ -515,6 +519,21 @@ class Request(object):
         """
         self._examples = examples
 
+    def set_schemas(self, other):
+        """ Sets the schema of this request to the schema of
+        the input parameter (without deep copying).
+
+        @param other: The request whose schemas should be equal
+                      to this request's schemas.
+        @type  other: Request
+        @return: None
+
+        """
+        self.set_examples(other.examples)
+        self.set_body_schema(other.body_schema)
+        self.set_query_schema(other.query_schema)
+        self.set_headers_schema(other.headers_schema)
+
     def set_body_schema(self, body_schema: BodySchema):
         """ Sets the Request's body schema
 
@@ -662,7 +681,12 @@ class Request(object):
             basepath = self._definition[basepath_idx][1]
             if Settings().basepath is not None:
                 basepath = Settings().basepath
+            # If the base path ends with a slash, remove it - the
+            # following line already contains a static slash
+            if basepath.endswith("/"):
+                basepath = basepath[:-1]
             self._definition[basepath_idx] = primitives.restler_static_string(basepath)
+
         else:
             # No basepath custom payload in the grammar - this is possible for older grammar versions.
             # Do nothing
@@ -680,7 +704,7 @@ class Request(object):
                 return i + 1
         return -1
 
-    def get_schema_combinations(self):
+    def get_schema_combinations(self, use_grammar_py_schema=False):
         """ A generator that lazily iterates over a pool of schema combinations
         for this request, determined the specified settings.
 
@@ -695,41 +719,87 @@ class Request(object):
         parameter combinations, there will be a total of 8 combinations.
 
         @return: (One or more copies of the request, each with a unique schema)
-        @rtype : (Request)
+        @rtype : List[(Request, is_example)]
 
         """
+        def get_all_example_schemas():
+            if self.examples is not None:
+                ex_schemas = self.get_example_payloads()
+                for ex_schema in itertools.islice(ex_schemas, Settings().max_examples):
+                    yield ex_schema
+
         tested_example_payloads = False
-        example_payloads = Settings().example_payloads
-        if example_payloads is not None and self.examples is not None:
+        if Settings().example_payloads is not None:
             tested_example_payloads = True
-            example_schemas = self.get_example_payloads()
-            for ex in itertools.islice(example_schemas, Settings().max_examples):
-                yield ex
+            for ex in get_all_example_schemas():
+                yield ex, True
 
         tested_param_combinations = False
         header_param_combinations = Settings().header_param_combinations
         if header_param_combinations is not None:
             tested_param_combinations = True
             for hpc in self.get_header_param_combinations(header_param_combinations):
-                yield hpc
+                yield hpc, False
 
         query_param_combinations = Settings().query_param_combinations
         if query_param_combinations is not None:
             tested_param_combinations = True
             for hpc in self.get_query_param_combinations(query_param_combinations):
-                yield hpc
+                yield hpc, False
 
         if not (tested_param_combinations or tested_example_payloads):
-            yield self
+            # When no test combination settings are specified, RESTler will try
+            # a small number of schema combinations that are likely to get the request to
+            # successfully execute.
 
-    def init_fuzzable_values(self, req_definition, candidate_values_pool, preprocessing=False):
+            tested_all_params = False
+            tested_first_example = False
+            # To minimize breaking changes, always execute the first request from the grammar
+            # This is necessary because not all schema elements are implemented in 'request_params' yet (for example,
+            # writer variables are not yet supported).
+            # In the future, this may still be necessary for cases when the user manually modifies the grammar.
+            # This will be controlled with an 'allow_grammar_py_modifications' option.
+            if use_grammar_py_schema:
+                # Remember which case was already tested, to avoid duplication.
+                if self.examples is None:
+                    tested_all_params = True
+                else:
+                    tested_first_example = True
+                yield self, tested_first_example
+
+            # If examples are available, test all the examples (up to the maximum in the settings)
+            example_schemas = get_all_example_schemas()
+            # If there is at least one example, skip the first one because it was already tested above (the first
+            # example is always present in the grammar).
+            if tested_first_example:
+                next(example_schemas)
+            for ex in example_schemas:
+                yield ex, True
+
+            if not tested_all_params:
+                param_schema_combinations = {
+                    "max_combinations": 1,
+                    "param_kind": "all",
+                    "choose_n": "max"
+                }
+                yield self.get_parameters_from_schema(param_schema_combinations), False
+
+            # Test all required parameters (obtained from the schema, without examples)
+            param_schema_combinations = {
+                "max_combinations": 1,
+                "param_kind": "optional"
+            }
+            yield self.get_parameters_from_schema(param_schema_combinations), False
+
+    def init_fuzzable_values(self, req_definition, candidate_values_pool, preprocessing=False, log_dict_err_to_main=True):
         def _raise_dict_err(type, tag):
-            logger.write_to_main(
-                f"Error for request {self.method} {self.endpoint_no_dynamic_objects}.\n"
-                f"{type} exception: {tag} not found.\n"
-                "Make sure you are using the dictionary created during compilation.",
-                print_to_console=True
-            )
+            if log_dict_err_to_main:
+                logger.write_to_main(
+                    f"Error for request {self.method} {self.endpoint_no_dynamic_objects}.\n"
+                    f"{type} exception: {tag} not found.\n"
+                    "Make sure you are using the dictionary created during compilation.",
+                    print_to_console=True
+                )
             raise InvalidDictionaryException
 
         fuzzable = []
@@ -774,14 +844,23 @@ class Request(object):
                 values = [(primitives.restler_fuzzable_uuid4, quoted, writer_variable)]
             # Handle enums that have a list of values instead of one default val
             elif primitive_type == primitives.FUZZABLE_GROUP:
+                values = []
+                # Handle example values
+                for ex_value in examples:
+                    if ex_value is None:
+                        ex_value = "null"
+                    elif quoted:
+                        ex_value = f'"{ex_value}"'
+                    values.append(ex_value)
                 if quoted:
-                    values = [f'"{val}"' for val in default_val]
+                    enum_values = [f'"{val}"' for val in default_val]
                 else:
-                    values = list(default_val)
+                    enum_values = list(default_val)
+                values.extend(enum_values)
             # Handle static whose value is the field name
             elif primitive_type == primitives.STATIC_STRING:
                 val = default_val
-                if val == None:
+                if val is None:
                     # the examplesChecker may inject None/null, so replace these with the string 'null'
                     logger.raw_network_logging(f"Warning: there is a None value in a STATIC_STRING.")
                     val = 'null'
@@ -852,7 +931,7 @@ class Request(object):
                 random.shuffle(values)
 
             if len(values) == 0:
-                _raise_dict_err(primitive_type, current_fuzzable_tag)
+                _raise_dict_err(primitive_type, "empty value list")
 
             # When testing all combinations, update tracked parameters.
             if Settings().fuzzing_mode == 'test-all-combinations':
@@ -870,7 +949,22 @@ class Request(object):
 
         return fuzzable, writer_variables, tracked_parameters
 
-    def render_iter(self, candidate_values_pool, skip=0, preprocessing=False, prev_rendered_values=None):
+    @staticmethod
+    def init_value_generators(fuzzable_request_blocks, fuzzable, value_gen_tracker):
+        value_generators = {}
+        for idx in fuzzable_request_blocks:
+            if fuzzable[idx] \
+            and isinstance(fuzzable[idx][0], tuple)\
+            and primitives.is_value_generator(fuzzable[idx][0][0]):
+                value_gen_wrapper = fuzzable[idx][0][0]
+                value_generator = value_gen_wrapper(value_gen_tracker, idx)
+                # Replace the wrapper with the generator in the tuple.
+                tmp_list = list(fuzzable[idx][0])
+                tmp_list[0] = value_generator
+                value_generators[idx] = tuple(tmp_list)
+        return value_generators
+
+    def render_iter(self, candidate_values_pool, skip=0, preprocessing=False, prev_rendered_values=None, value_list=False):
         """ This is the core method that renders values combinations in a
         request template. It basically is a generator which lazily iterates over
         a pool of possible combination of values that fit the template of the
@@ -889,6 +983,12 @@ class Request(object):
         @type skip: Int
         @param preprocessing: Set to True if this rendering is happening during preprocessing
         @type  preprocessing: Bool
+        @param prev_rendered_values: Set to True if this rendering is happening during preprocessing
+        @type  prev_rendered_values: Dict[Int, Str]
+        @param value_list: Set to True to return the list of elements of the rendered request
+                           corresponding to the request definition.  If False,
+                           the rendered request is returned as a string.
+        @type  value_list: Bool
 
         @return: (rendered request's payload, response's parser function, request's tracked parameter values)
         @rtype : (Str, Function Pointer, List[Str])
@@ -903,19 +1003,6 @@ class Request(object):
             )
             raise InvalidDictionaryException
 
-        def init_value_generators(fuzzable_request_blocks, fuzzable, value_gen_tracker):
-            value_generators = {}
-            for idx in fuzzable_request_blocks:
-                if fuzzable[idx] \
-                and isinstance(fuzzable[idx][0], tuple)\
-                and primitives.is_value_generator(fuzzable[idx][0][0]):
-                    value_gen_wrapper = fuzzable[idx][0][0]
-                    value_generator = value_gen_wrapper(value_gen_tracker, idx)
-                    # Replace the wrapper with the generator in the tuple.
-                    tmp_list = list(fuzzable[idx][0])
-                    tmp_list[0] = value_generator
-                    value_generators[idx] = tuple(tmp_list)
-            return value_generators
 
         if not candidate_values_pool:
             print("Candidate values pool empty")
@@ -932,8 +1019,12 @@ class Request(object):
         # constructed, since not all of them may be needed, e.g. during smoke test mode.
         next_combination = 0
         schema_idx = -1
-        schema_combinations = itertools.islice(self.get_schema_combinations(), Settings().max_schema_combinations)
-        for req in schema_combinations:
+        schema_combinations = itertools.islice(self.get_schema_combinations(
+                                                    use_grammar_py_schema=Settings().allow_grammar_py_user_update),
+                                               Settings().max_schema_combinations)
+        remaining_combinations_count = Settings().max_combinations - skip
+
+        for (req, is_example) in schema_combinations:
             schema_idx += 1
             parser = None
             fuzzable_request_blocks = []
@@ -955,8 +1046,8 @@ class Request(object):
             # be cached and re-used.
             value_gen_tracker = self._rendered_values_cache.value_gen_tracker
             if schema_idx not in self._rendered_values_cache._value_generators:
-                value_generators = init_value_generators(fuzzable_request_blocks, fuzzable,
-                                                         value_gen_tracker)
+                value_generators = Request.init_value_generators(fuzzable_request_blocks, fuzzable,
+                                                                 value_gen_tracker)
                 self._rendered_values_cache.value_generators[schema_idx] = value_generators
             value_generators = self._rendered_values_cache.value_generators[schema_idx]
 
@@ -971,7 +1062,10 @@ class Request(object):
                 # Keep plugging in values from the static combinations pool while dynamic
                 # values are available.
                 combinations_pool = itertools.cycle(combinations_pool)
-            combinations_pool = itertools.islice(combinations_pool, Settings().max_combinations)
+            # If this is an example payload, only use the first combination.  This contains the original example
+            # values.
+            max_combinations = 1 if is_example else Settings().max_combinations
+            combinations_pool = itertools.islice(combinations_pool, max_combinations)
 
             # skip combinations, if asked to
             while next_combination < skip:
@@ -988,6 +1082,9 @@ class Request(object):
             # for each combination's values render dynamic primitives and resolve
             # dependent variables
             for ind, values in enumerate(combinations_pool):
+                if remaining_combinations_count == 0:
+                    break
+
                 values = list(values)
 
                 # Use saved value generators.
@@ -1011,6 +1108,7 @@ class Request(object):
                     len(value_generators) == len(value_gen_tracker):
                         break
 
+                dynamic_object_variables_to_update = {}
                 for val_idx, val in enumerate(values):
                     (writer_variable, writer_is_quoted) = writer_variables[val_idx]
                     if writer_variable is not None:
@@ -1018,7 +1116,7 @@ class Request(object):
                         # It will be quoted again at the time it is used, if needed
                         if writer_is_quoted:
                             val = val[1:-1]
-                        dependencies.set_variable(writer_variable, val)
+                        dynamic_object_variables_to_update[writer_variable] = val
 
                 tracked_parameter_values = {}
                 for (k, idx_list) in tracked_parameters.items():
@@ -1034,11 +1132,31 @@ class Request(object):
                 if cached_values:
                     self._rendered_values_cache.add_fuzzable_values(next_combination, cached_values)
 
-                rendered_data = "".join(values)
-                yield rendered_data, parser, tracked_parameter_values
+                # Encode the path and query parameters, except custom payloads which are expected
+                # to be used exactly as-is
+                url_encode_start, url_encode_end = req.get_path_and_query_start_end()
+                for url_idx in range(url_encode_start, url_encode_end):
+                    # Only encode the parameter values, not static strings
+                    if req.definition[url_idx][0] not in [primitives.STATIC_STRING,
+                                                          primitives.REFRESHABLE_AUTHENTICATION_TOKEN,
+                                                          primitives.CUSTOM_PAYLOAD,
+                                                          primitives.CUSTOM_PAYLOAD_HEADER,
+                                                          primitives.CUSTOM_PAYLOAD_QUERY,
+                                                          primitives.CUSTOM_PAYLOAD_UUID4_SUFFIX]:
+                        values[url_idx] = url_quote_plus(values[url_idx], safe="/")
+
+                if value_list:
+                    rendered_data = values
+                else:
+                    rendered_data = "".join(values)
+
+                # Save the schema for this combination.
+                self._last_rendered_schema_request = (req, is_example)
+
+                yield rendered_data, parser, tracked_parameter_values, dynamic_object_variables_to_update
 
                 next_combination = next_combination + 1
-
+                remaining_combinations_count = remaining_combinations_count - 1
 
     def render_current(self, candidate_values_pool, preprocessing=False, use_last_cached_rendering=False):
         """ Renders the next combination for the current request.
@@ -1159,10 +1277,11 @@ class Request(object):
         # These special headers are not fuzzed, and should not be replaced
         skipped_headers_str = ["Accept", "Host"]
         required_header_blocks = []
+        auth_token = []
         append_header = False
         for line in old_request.definition[header_start_index : header_end_index]:
             if line[0] == "restler_refreshable_authentication_token":
-                required_header_blocks.append(line)
+                auth_token.append(line)
                 continue
             if append_header:
                 required_header_blocks.append(line)
@@ -1175,9 +1294,15 @@ class Request(object):
                         # Continue to append
                         append_header = True
 
+        # Note: currently, the required header blocks must be placed at the end, since the auth primitive is being
+        # used as a delimiter.
         # Make sure there is still a delimiter between headers and the remainder of the payload
-        new_header_blocks.append(primitives.restler_static_string("\r\n"))
-        new_definition = old_request.definition[:header_start_index] + required_header_blocks + new_header_blocks + old_request.definition[header_end_index:]
+        new_definition = old_request.definition[:header_start_index] +\
+                         required_header_blocks +\
+                         new_header_blocks +\
+                         auth_token +\
+                         [ primitives.restler_static_string("\r\n") ] +\
+                         old_request.definition[header_end_index:]
         new_definition += [old_request.metadata.copy()]
         new_request = Request(new_definition)
         # Update the new Request object with the create once requests data of the old Request,
@@ -1186,15 +1311,21 @@ class Request(object):
         return new_request
 
     def get_query_param_combinations(self, query_param_combinations_setting):
+        """ Gets the query parameter combinations according to the specified setting.
         """
-        """
+        fuzzing_config = FuzzingConfig()
         for param_list in param_combinations.get_param_combinations(self, query_param_combinations_setting,
                                                                     self.query_schema.param_list, "query"):
             query_schema = QueryList(param=param_list)
-            query_blocks = query_schema.get_blocks()
+            query_blocks = query_schema.get_original_blocks(fuzzing_config)
+            # query_blocks = query_schema.get_blocks()
 
             new_request = self.substitute_query(query_blocks)
             if new_request:
+                # The schemas need to be copied because this new request will be passed into checkers,
+                # and the schema needs to exist.
+                # TODO: are there any cases where it needs to correspond to the request definition?
+                new_request.set_schemas(self)
                 yield new_request
             else:
                 # For malformed requests, it is possible that the place to insert parameters is not found,
@@ -1202,23 +1333,50 @@ class Request(object):
                 logger.write_to_main(f"Warning: could not substitute query parameters.")
 
     def get_header_param_combinations(self, header_param_combinations_setting):
+        """ Gets the header parameter combinations according to the specified setting.
         """
-
-        """
+        fuzzing_config = FuzzingConfig()
         for param_list in param_combinations.get_param_combinations(self, header_param_combinations_setting,
                                                                     self.headers_schema.param_list, "header"):
             headers_schema = HeaderList(param=param_list)
-            header_blocks = headers_schema.get_blocks()
+            header_blocks = headers_schema.get_original_blocks(fuzzing_config)
+            # header_blocks = headers_schema.get_blocks()
 
             new_request = self.substitute_headers(header_blocks)
             if new_request:
+                # The schemas need to be copied because this new request will be passed into checkers,
+                # and the schema needs to exist.
+                # TODO: are there any cases where it needs to correspond to the request definition?
+                new_request.set_schemas(self)
                 yield new_request
             else:
                 # For malformed requests, it is possible that the place to insert parameters is not found,
                 # In such cases, skip the combination.
                 logger.write_to_main(f"Warning: could not substitute header parameters.")
 
-    def get_example_payloads(self, example_payloads_setting=None):
+    def get_body_param_combinations(self, body_param_combinations_setting):
+        fuzzing_config = FuzzingConfig()
+        for new_body_schema in param_combinations.get_body_param_combinations(self, body_param_combinations_setting,
+                                                                              self.body_schema):
+            new_body_schema.set_config(fuzzing_config) # This line is required for legacy reasons
+            new_body_blocks = new_body_schema.get_original_blocks(fuzzing_config)
+            # new_body_blocks = new_body_schema.get_blocks()
+
+            if new_body_blocks:
+                new_request = self.substitute_body(new_body_blocks)
+
+            if new_request:
+                # The schemas need to be copied because this new request will be passed into checkers,
+                # and the schema needs to exist.
+                # TODO: are there any cases where it needs to correspond to the request definition?
+                new_request.set_schemas(self)
+                yield new_request
+            else:
+                # For malformed requests, it is possible that the place to insert parameters is not found,
+                # In such cases, skip the combination.
+                logger.write_to_main(f"Warning: could not substitute body when generating parameter combinations.")
+
+    def get_example_payloads(self):
         """
         Replaces the body, query, and headers of this request by the available examples.
         """
@@ -1244,6 +1402,8 @@ class Request(object):
         check_example_schema_is_valid(num_query_payloads, max_example_payloads, "query")
         check_example_schema_is_valid(num_body_payloads, max_example_payloads, "body")
 
+        fuzzing_config = FuzzingConfig()
+
         for payload_idx in range(max_example_payloads):
             body_example = None
             query_example = None
@@ -1256,22 +1416,27 @@ class Request(object):
             if num_header_payloads > 0:
                 header_example = self.examples.header_examples[payload_idx]
 
-            # Copy the request definition and reset it here.
+            # Create the new request
+            # Note: the code below that generates the python grammar from the schema *must*
+            # use 'get_blocks' instead of 'get_original_blocks'.  This is because in the main algorithm, only one
+            # combination for each example (the example itself) should be generated.
+            # For example, 'get_original_blocks' may have a 'restler_fuzzable_group' for enum values, but the
+            # example may only be applicable to one enum value.
             new_request = self
             body_blocks = None
             query_blocks = None
             header_blocks = None
             if body_example:
-                body_blocks = body_example.get_blocks()
+                body_blocks = body_example.get_original_blocks(fuzzing_config)
                 # Only substitute the body if there is a body.
                 if body_blocks:
                     new_request = new_request.substitute_body(body_blocks)
 
             if query_example:
-                query_blocks = query_example.get_blocks()
+                query_blocks = query_example.get_original_blocks(fuzzing_config)
                 new_request = new_request.substitute_query(query_blocks)
             if header_example:
-                header_blocks = header_example.get_blocks()
+                header_blocks = header_example.get_original_blocks(fuzzing_config)
                 new_request = new_request.substitute_headers(header_blocks)
 
             if new_request:
@@ -1283,6 +1448,19 @@ class Request(object):
                 # For malformed requests, it is possible that the place to insert query parameters is not found,
                 # so the query parameters cannot be inserted. In such cases, skip the example.
                 logger.write_to_main(f"Warning: could not substitute example parameters for example {payload_idx}.")
+
+    def get_parameters_from_schema(self, combination_settings=None):
+        """ Get the parameters for this request schema, as specified in combination_settings.
+        """
+        req_current = self
+        if self.headers_schema:
+            req_current = next(req_current.get_header_param_combinations(combination_settings))
+        if self.query_schema:
+            req_current = next(req_current.get_query_param_combinations(combination_settings))
+        if self.body_schema:
+            req_current = next(req_current.get_body_param_combinations(combination_settings))
+
+        return req_current
 
     def get_body_start(self):
         """ Get the starting index of the request body
@@ -1312,12 +1490,41 @@ class Request(object):
         except Exception:
             pass
 
+        # Also try searching for the body after the authentication token
+        # There must be \r\n around the body.  Find this and return the body index if the body start
+        # character is found.
+        if dict_index == -1 and array_index == -1:
+            body_delim_patterns = [
+                primitives.restler_static_string('\r\n'),
+                primitives.restler_static_string('\r\n\r\n')
+            ]
+            try:
+                auth_tokens = [i for i, x in enumerate(request.definition)
+                               if x[0] == primitives.REFRESHABLE_AUTHENTICATION_TOKEN]
+                if auth_tokens:
+                    auth_token_index = auth_tokens[0]
+                    for idx in range(auth_token_index + 1, len(request.definition)-1):
+                        if request.definition[idx] not in body_delim_patterns and\
+                                request.definition[idx][0] in [primitives.STATIC_STRING, primitives.FUZZABLE_OBJECT]:
+                            if request.definition[idx][1].startswith("{"):
+                                dict_index = idx
+                                break
+                            if request.definition[idx][1].startswith("["):
+                                array_index = idx
+                                break
+                    # If the body was not found using the above method, simply assume that the body starts
+                    # after the authentication token delimiter.  This is a best-effort workaround for the currently
+                    # unsupported case of non-json bodies.
+                    if dict_index == -1 and array_index == -1 and len(request.definition) > auth_token_index + 1:
+                        return auth_token_index + 2
+            except Exception:
+                pass
+
         if dict_index == -1 or array_index == -1:
             # If one of the indices is -1 then it wasn't found, return the other
             return max(dict_index, array_index)
         # Return the lowest index / first character found in body.
         return min(dict_index, array_index)
-
 
     def get_query_start_end(self):
         """ Get the start and end index of a request's query
@@ -1366,7 +1573,19 @@ class Request(object):
         # substitute the body definition with the new one
         idx = old_request.get_body_start()
         if idx == -1:
-            return None
+            # This may be a case where grammar.py does not have a body, because the body is optional, and
+            # the first example value does not have a body ('body_example' is None below)
+            # Since substitute_body is invoked only when there is a body schema, simply append the body
+            # to the end of the request.
+            first_example_has_no_body = False
+            if self.examples is not None and self.examples.body_examples:
+                first_body_example = self.examples.body_examples[0]
+                if first_body_example is None:
+                    first_example_has_no_body = True
+            if first_example_has_no_body:
+                idx = len(old_request.definition)
+            else:
+                return None
 
         new_definition = old_request.definition[:idx] + new_body_blocks
         new_definition += [old_request.metadata.copy()]
@@ -1374,11 +1593,6 @@ class Request(object):
         # Update the new Request object with the create once requests data of the old Request,
         # so bug replay logs will include the necessary create once request data.
         new_request._create_once_requests = old_request._create_once_requests
-
-        # Update the new request with the query and header schemas of the old request, since
-        # these must still be present for correctly rendering the request combinations.
-        new_request.set_headers_schema(old_request.headers_schema)
-        new_request.set_query_schema(old_request.query_schema)
         return new_request
 
     def substitute_query(self, new_query_blocks):
@@ -1415,6 +1629,33 @@ class Request(object):
         # so bug replay logs will include the necessary create once request data.
         new_request._create_once_requests = old_request._create_once_requests
         return new_request
+
+    def get_path_and_query_start_end(self):
+        """ Get the start and end of the path, including the query if it exists
+
+        @param request: The target request
+        @type  request: Request
+
+        @return: A tuple containing the start and end index
+        @rtype : Tuple(int, int) or (-1, -1) on failure
+
+        """
+        request = self
+        path_start_index = None
+        query_end_str = ' HTTP'
+
+        for idx, line in enumerate(request.definition):
+            if line[0] == primitives.STATIC_STRING and line[1].startswith("/"):
+                path_start_index = idx
+                break
+        if path_start_index is None:
+            return -1, -1
+
+        for idx, line in enumerate(request.definition):
+            if line[1].startswith(query_end_str):
+                query_end_index = idx
+                return path_start_index, query_end_index
+        return -1, -1
 
 
 def GrammarRequestCollection():
@@ -1579,19 +1820,6 @@ class RequestCollection(object):
         self.candidate_values_pool.set_candidate_values(custom_mutations, per_endpoint_custom_mutations)
         if value_generators_file_path:
             self.candidate_values_pool.set_value_generators(value_generators_file_path)
-
-    def remove_authentication_tokens(self):
-        """ Removes the authentication token line from each request in the collection
-
-        @return: None
-        @rtype : None
-
-        """
-        for req in self._requests:
-            for line in req.definition:
-                if line[0] == primitives.REFRESHABLE_AUTHENTICATION_TOKEN:
-                    req._definition.remove(line)
-                    break
 
     @property
     def request_id_collection(self):

@@ -87,6 +87,14 @@ def des_request_param_payload(request_param_payload_json):
 
     return [KeyPayload(None, None)]
 
+def des_dynamic_object(dynobj_json_grammar):
+    """Parses dynamic object variable information from the grammar json"""
+    primitive_type = dynobj_json_grammar['primitiveType']
+    variable_name = dynobj_json_grammar['variableName']
+    is_writer = dynobj_json_grammar['isWriter']
+
+    return DynamicObject(primitive_type, variable_name, is_writer)
+
 def des_param_payload(param_payload_json, tag='', body_param=True):
     """ Deserialize ParameterPayload type object.
 
@@ -102,6 +110,8 @@ def des_param_payload(param_payload_json, tag='', body_param=True):
 
     """
     param = None
+    STRING_CONTENT_TYPES = ['String', 'Uuid', 'DateTime', 'Date']
+    param_properties = None
 
     if 'InternalNode' in param_payload_json:
         internal_node = param_payload_json['InternalNode']
@@ -115,6 +125,12 @@ def des_param_payload(param_payload_json, tag='', body_param=True):
         else:
             is_required = True
 
+        if 'isReadOnly' in internal_info: # check for backwards compatibility of old schemas
+            is_readonly = internal_info['isReadOnly']
+        else:
+            is_readonly = False
+
+        param_properties = ParamProperties(is_required=is_required, is_readonly=is_readonly)
         if tag:
             next_tag = tag + '_' + name
         else:
@@ -127,10 +143,10 @@ def des_param_payload(param_payload_json, tag='', body_param=True):
                 value = des_param_payload(data, next_tag)
                 values.append(value)
 
-            array = ParamArray(values)
+            array = ParamArray(values, param_properties=param_properties)
 
             if body_param and name:
-                param = ParamMember(name, array, is_required)
+                param = ParamMember(name, array, param_properties=param_properties)
             else:
                 param = array
 
@@ -143,7 +159,7 @@ def des_param_payload(param_payload_json, tag='', body_param=True):
                 member = des_param_payload(member_json, tag)
                 members.append(member)
 
-            param = ParamObject(members)
+            param = ParamObject(members, param_properties=param_properties)
 
             param.tag = f'{next_tag}_object'
 
@@ -154,7 +170,7 @@ def des_param_payload(param_payload_json, tag='', body_param=True):
 
             value = des_param_payload(internal_data[0], next_tag)
 
-            param = ParamMember(name, value, is_required)
+            param = ParamMember(name, value, param_properties=param_properties)
 
         # others
         else:
@@ -170,45 +186,55 @@ def des_param_payload(param_payload_json, tag='', body_param=True):
         else:
             is_required = True
 
+        if 'isReadOnly' in leaf_node: # check for backwards compatibility of old schemas
+            is_readonly = leaf_node['isReadOnly']
+        else:
+            is_readonly = False
+        param_properties = ParamProperties(is_required=is_required, is_readonly=is_readonly)
+
         # payload is a dictionary (or member) with size 1
         if len(payload) != 1:
             logger.write_to_main(f'Unexpected payload format {payload}')
 
         content_type = 'Unknown'
         content_value = 'Unknown'
+        param_name = None
         example_values = []
         custom_payload_type = None
         fuzzable = False
-        is_dynamic_object = False
+        dynamic_object = None
 
         if 'Fuzzable' in payload:
             content_type = payload['Fuzzable']['primitiveType']
             content_value = payload['Fuzzable']['defaultValue']
             if 'exampleValue' in payload['Fuzzable']:
-                example_values = [payload['Fuzzable']['exampleValue']]
+                # Workaround for the way null values are serialized to the example
+                example_value = payload['Fuzzable']['exampleValue']
+                if isinstance(example_value, dict) and 'Some' in example_value.keys() and example_value['Some'] is None:
+                    example_value = None
+                example_values = [example_value]
+            if 'dynamicObject' in payload['Fuzzable']:
+                dynamic_object = des_dynamic_object(payload['Fuzzable']['dynamicObject'])
+            if 'parameterName' in payload['Fuzzable']:
+                param_name = payload['Fuzzable']['parameterName']
             fuzzable = True
         elif 'Constant' in payload:
             content_type = payload['Constant'][0]
             content_value = payload['Constant'][1]
         elif 'DynamicObject' in payload:
-            content_type = payload['DynamicObject']['primitiveType']
-            content_value = payload['DynamicObject']['variableName']
-            is_dynamic_object = True
+            dynamic_object = des_dynamic_object(payload['DynamicObject'])
+            content_type = dynamic_object._primitive_type
+            content_value = dynamic_object._variable_name
         elif 'Custom' in payload:
             content_type = payload['Custom']['primitiveType']
             content_value = payload['Custom']['payloadValue']
             custom_payload_type = payload['Custom']['payloadType']
-
-            # TODO: these dynamic objects are not yet supported in the schema.
-            # This dictionary is currently not used, and will be used once
-            # dynamic objects are added to the schema types below (ParamValue, etc.).
-            dynamic_object_input_variable=None
             if 'dynamicObject' in payload['Custom']:
-                dynamic_object_input_variable={}
-                dynamic_object_input_variable['content_type'] = payload['Custom']['dynamicObject']['primitiveType']
-                dynamic_object_input_variable['content_value'] = payload['Custom']['dynamicObject']['variableName']
-
+                dynamic_object = des_dynamic_object(payload['Custom']['dynamicObject'])
         elif 'PayloadParts' in payload:
+            # Note: 'PayloadParts' is no longer supported in the compiler.
+            # This code is present to support old grammars, and should be
+            # removed with an exception to recompile in the future.
             definition = payload['PayloadParts'][-1]
             if 'Custom' in definition:
                 content_type = definition['Custom']['primitiveType']
@@ -217,24 +243,28 @@ def des_param_payload(param_payload_json, tag='', body_param=True):
 
         # create value w.r.t. the type
         value = None
-        if content_type in ['String', 'Uuid', 'DateTime', 'Date']:
+        if content_type in STRING_CONTENT_TYPES:
             # Query or header parameter values should not be quoted
             is_quoted = body_param
-            value = ParamString(custom_payload_type=custom_payload_type, is_required=is_required,
-                                is_dynamic_object=is_dynamic_object, is_quoted=is_quoted, content_type=content_type)
+            if custom_payload_type == "UuidSuffix":
+                # Set as unknown for payload body fuzzing purposes.
+                # This will be fuzzed as a string.
+                value = ParamUuidSuffix(param_properties=param_properties, dynamic_object=dynamic_object,
+                                        is_quoted=is_quoted,
+                                        content_type=content_type)
+                value.set_unknown()
+            else:
+                value = ParamString(custom_payload_type=custom_payload_type, param_properties=param_properties,
+                                    dynamic_object=dynamic_object, is_quoted=is_quoted, content_type=content_type)
+
         elif content_type == 'Int':
-            value = ParamNumber(is_required=is_required, is_dynamic_object=is_dynamic_object, number_type=content_type)
+            value = ParamNumber(param_properties=param_properties, dynamic_object=dynamic_object, number_type=content_type)
         elif content_type == 'Number':
-            value = ParamNumber(is_required=is_required, is_dynamic_object=is_dynamic_object, number_type=content_type)
+            value = ParamNumber(param_properties=param_properties, dynamic_object=dynamic_object, number_type=content_type)
         elif content_type == 'Bool':
-            value = ParamBoolean(is_required=is_required, is_dynamic_object=is_dynamic_object)
+            value = ParamBoolean(param_properties=param_properties, dynamic_object=dynamic_object)
         elif content_type == 'Object':
-            value = ParamObjectLeaf(is_required=is_required, is_dynamic_object=is_dynamic_object)
-        elif custom_payload_type is not None and custom_payload_type == 'UuidSuffix':
-            value = ParamUuidSuffix(is_required=is_required)
-            # Set as unknown for payload body fuzzing purposes.
-            # This will be fuzzed as a string.
-            value.set_unknown()
+            value = ParamObjectLeaf(param_properties=param_properties, dynamic_object=dynamic_object)
         elif 'Enum' in content_type:
             # unique case for Enums, as they are defined as
             # "fuzzable" types in the schema, but are not fuzzable
@@ -254,15 +284,23 @@ def des_param_payload(param_payload_json, tag='', body_param=True):
                 enum_name = enum_definition[0]
                 enum_content_type = enum_definition[1]
                 contents = enum_definition[2]
-                value = ParamEnum(contents, enum_content_type, is_required=is_required, body_param=body_param, enum_name=enum_name)
+                # Get quoting depending on the type
+                if enum_content_type in STRING_CONTENT_TYPES:
+                    is_quoted = body_param
+                else:
+                    is_quoted = False
+                value = ParamEnum(contents, enum_content_type, is_quoted=is_quoted,
+                                  param_properties=param_properties, body_param=body_param, enum_name=enum_name)
             else:
                 logger.write_to_main(f'Unexpected enum schema {name}')
         else:
-            value = ParamString(False, is_required=is_required, is_dynamic_object=is_dynamic_object)
+            value = ParamString()
             value.set_unknown()
 
         value.set_fuzzable(fuzzable)
         value.set_example_values(example_values)
+        value.set_param_name(param_name)
+        value.set_dynamic_object(dynamic_object)
         value.set_content_type(content_type)
         value.content = content_value
 
@@ -275,7 +313,7 @@ def des_param_payload(param_payload_json, tag='', body_param=True):
 
         # create the param node
         if name:
-            param = ParamMember(name, value, is_required=is_required)
+            param = ParamMember(name, value, param_properties=param_properties)
         else:
             # when a LeafNode represent a standard type, e.g.,
             # string, the name will be empty

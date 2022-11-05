@@ -80,6 +80,15 @@ The fuzzing mode. Options are:
 ### garbage_collection_interval: int (default None)
 Length of time between garbage collection calls (seconds, None = no garbage collection)
 
+### run_gc_after_every_sequence: bool (default False)
+If True, clean up dynamic objects after every sequence, instead of asynchronously
+at every ```garbage_collection_interval```.
+
+### max_objects_per_resource_type: int (default None)
+If specified, RESTler checks how many objects of each resource type
+are left after each garbage collection and fails if the count for any resource type
+exceeds the maximum.
+
 ### garbage_collector_cleanup_time: int (default 300)
 Length of time the garbage collector will attempt to cleanup remaining resources
 at the end of fuzzing (seconds)
@@ -178,6 +187,8 @@ __max_examples__
 For request types where one or more examples are provided, this option limits
 the number of examples that will be tested.
 
+### max_sequence_length: int (default 100)
+The maximum length of fuzzed request sequences.
 
 ### add_fuzzable_dates: bool (default False)
 Set to True to generate additional dates
@@ -185,6 +196,7 @@ near the current date (e.g. one in the future) that will be used for fuzzable da
 the values specified in the dictionary.
 Since some API parameters require a current or future date,
 this setting can be used to generate those values, without having to modify the dictionary.
+When enabled, the date component of example values is also updated to be a future date.
 
 ### max_request_execution_time: float (default 120, max 600)
 The maximum amount of time, in seconds, to wait for a response after sending a request.
@@ -198,6 +210,39 @@ Filters the grammar to only use endpoints whose paths contain the given regex st
 Example: `(\w*)/virtualNetworks/(\w*)`
 
 Example: `disk|virtualNetwork`
+
+### include_requests: list (default empty list=No filtering)
+Filters the grammar to include only the specified endpoints and methods.  If no ```methods``` key is specified, all methods are included.
+Note: if the included request depends on pre-requisite resources that are created by other
+requests, all requests required to create the dependency will be exercised. For example, the endpoint
+below requires a ```postId``` that is obtained by executing ```POST /api/blog/posts``` - this request will
+also be executed, even though it is not included in the list below.  A future improvement will filter out
+such requests from fuzzing, but currently they will be fuzzed as well.
+
+```json
+  "include_requests": [
+    {
+      "endpoint": "/api/blog/posts/{postId}",
+    }
+  ]
+```
+
+### exclude_requests: list (default empty list=No filtering)
+Filters the grammar to exclude the specified endpoints and methods.
+
+Note: although the ```DELETE``` is excluded from fuzzing below, it will still be executed by the RESTler
+garbage collector to clean up the blog posts that were created in order to test the other requests with
+endpoint ```/api/blog/posts/{postId}```.  To completely exclude ```DELETE```s from running, you must filter them
+manually from grammar.py.
+
+```json
+  "exclude_requests": [
+    {
+      "endpoint": "/api/blog/posts/{postId}",
+      "methods": ["GET", "DELETE"]
+    }
+  ]
+```
 
 ### save_results_in_fixed_dirname: bool (default False)
 Save the results in a directory with a fixed name (skip the 'experiment\<pid\>' subdir).
@@ -425,7 +470,7 @@ value_generators = {
     "global_producer_timing_delay": 2,
     "dyn_objects_cache_size":20,
     "fuzzing_mode": "directed-smoke-test",
-    "path_regex": "(\\w*)/ddosProtectionPlans(\\w*)",
+    "path_regex": "(\\w*)/blog/posts(\\w*)",
     "per_resource_settings": {
         "/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.Network/dnsZones/{zoneName}/{recordType}/{relativeRecordSetName}": {
             "producer_timing_delay": 1,

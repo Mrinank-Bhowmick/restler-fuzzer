@@ -7,6 +7,7 @@ import sys
 import os
 import time
 import datetime
+from datetime import datetime as dt
 import uuid
 import itertools
 import types
@@ -68,6 +69,8 @@ PARAM_NAME_ARG = 'param_name'
 WRITER_VARIABLE_ARG = 'writer'
 # Name of the function that wraps all value generators
 
+def is_date_type(primitive_type):
+    return primitive_type in [FUZZABLE_DATE, FUZZABLE_DATETIME]
 
 def is_value_generator(candidate_values):
     """ Returns whether the argument is a value generator
@@ -167,6 +170,8 @@ class CandidateValuesPool(object):
         self._create_fuzzable_dates()
         self._dates_added = False
         self._value_generators = None
+        self._add_examples = True
+        self._add_default_value = True
 
     def _create_fuzzable_dates(self):
         """ Creates dates for future and past, which can be added to a list
@@ -179,11 +184,48 @@ class CandidateValuesPool(object):
         today = datetime.datetime.today()
         # Make sure we add enough days to account for a long fuzzing run
         days_to_add = datetime.timedelta(days = (Settings().time_budget / 24) + 1)
-        future = today + days_to_add
-        self._future_date = future.strftime(PAYLOAD_DATE_FORMAT)
+        self._future = today + days_to_add
+        self._future_date = self._future.strftime(PAYLOAD_DATE_FORMAT)
         oneday = datetime.timedelta(days=1)
         yesterday = today - oneday
         self._past_date = yesterday.strftime(PAYLOAD_DATE_FORMAT)
+
+    def _get_current_date_from_example(self, example_date, future_date=None):
+        """ Takes the example date and returns a date with the same time components
+            but with the date after the maximum length of the fuzzing run.
+        """
+        if example_date is None:
+            return example_date
+
+        date_formats = [
+            "%Y-%m-%d",
+            "%m/%d/%Y",
+        ]
+        # Check if the example contains a date in the above formats.
+        # If so, substitute the future date in the same format.
+        # Note: currently, this will only work for common formats
+        # that start with the date in one of the formats specified above.
+        delimiters = [" ", "T"]
+        date_part = example_date
+        for delim in delimiters:
+            if delim in date_part:
+                date_part = date_part.split(delim)[0]
+
+        parsed_date = None
+        parsed_format_idx = None
+        for idx, fmt in enumerate(date_formats):
+            try:
+                parsed_date = dt.strptime(date_part, fmt)
+                parsed_format_idx = idx
+            except ValueError:
+                pass
+
+        if parsed_date is None:
+            return example_date
+
+        future_date = self._future if future_date is None else future_date
+        future_date_part = future_date.strftime(date_formats[parsed_format_idx])
+        return example_date.replace(date_part, future_date_part)
 
     def _add_fuzzable_dates(self, candidate_values):
         """ Adds fuzzable dates to a candidate values dict
@@ -376,11 +418,16 @@ class CandidateValuesPool(object):
         if quoted:
             default_value = f'"{default_value}"'
 
-        if examples:
+        if examples and self._add_examples:
             # Use the examples instead of default value
+
+            # Convert the example dates to current dates, if specified
+            get_current_date = Settings().add_fuzzable_dates and is_date_type(primitive_type)
             # Quote the example values if needed
             examples_quoted=[]
             for ex_value in examples:
+                if get_current_date:
+                    ex_value = self._get_current_date_from_example(ex_value)
                 if ex_value is None:
                     ex_value = "null"
                 elif quoted:
@@ -391,13 +438,8 @@ class CandidateValuesPool(object):
         # Only use the default value if no values are defined in
         # the dictionary for that fuzzable type and there are no
         # example values
-        if not fuzzable_values:
+        if not fuzzable_values and self._add_default_value:
             fuzzable_values.append(default_value)
-        elif primitive_type in [FUZZABLE_DATE, FUZZABLE_DATETIME] and\
-        len(fuzzable_values) == 2:
-            # Special case for fuzzable_datetime because there will always be
-            # two additional values for past/future in the list
-            fuzzable_values.insert(0, default_value)
 
         # Eliminate duplicates.
         # Note: for the case when a default (non-example) value is in the grammar,
@@ -408,10 +450,14 @@ class CandidateValuesPool(object):
 
         return unique_fuzzable_values
 
-    def set_value_generators(self, file_path):
+    def set_value_generators(self, file_path, random_seed=None):
         """ Imports the value generators from the specified module file path.
         """
-        self._value_generators = import_utilities.import_attr(file_path, "value_generators")
+        attrs = import_utilities.import_attrs(file_path, ["value_generators", "set_random_seed"])
+        self._value_generators = attrs[0]
+        random_seed_override_fn = attrs[1]
+        if random_seed is not None and random_seed_override_fn is not None:
+            random_seed_override_fn(random_seed)
 
     def set_candidate_values(self, custom_values, per_endpoint_custom_mutations=None):
         """ Overrides default primitive type values with user-provided ones.

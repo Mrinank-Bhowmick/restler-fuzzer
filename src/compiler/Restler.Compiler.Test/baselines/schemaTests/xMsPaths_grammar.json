@@ -10,6 +10,7 @@
         "method": "Put"
       },
       "method": "Put",
+      "basePath": "",
       "path": [
         {
           "Constant": [
@@ -112,6 +113,7 @@
         "method": "Put"
       },
       "method": "Put",
+      "basePath": "",
       "path": [
         {
           "Custom": {
@@ -172,10 +174,11 @@
                   "LeafNode": {
                     "name": "",
                     "payload": {
-                      "Constant": [
-                        "String",
-                        "2020-03-02"
-                      ]
+                      "Fuzzable": {
+                        "primitiveType": "String",
+                        "defaultValue": "fuzzstring",
+                        "exampleValue": "2020-03-02"
+                      }
                     },
                     "isRequired": true,
                     "isReadOnly": false
@@ -188,10 +191,11 @@
                   "LeafNode": {
                     "name": "",
                     "payload": {
-                      "Constant": [
-                        "String",
-                        "1.2.3.4"
-                      ]
+                      "Fuzzable": {
+                        "primitiveType": "String",
+                        "defaultValue": "fuzzstring",
+                        "exampleValue": "1.2.3.4"
+                      }
                     },
                     "isRequired": true,
                     "isReadOnly": false
@@ -310,6 +314,7 @@
         "method": "Put"
       },
       "method": "Put",
+      "basePath": "",
       "path": [
         {
           "Custom": {
@@ -469,6 +474,7 @@
         "method": "Get"
       },
       "method": "Get",
+      "basePath": "",
       "path": [
         {
           "DynamicObject": {
@@ -601,6 +607,7 @@
         "method": "Get"
       },
       "method": "Get",
+      "basePath": "",
       "path": [
         {
           "DynamicObject": {
@@ -694,6 +701,7 @@
         "method": "Delete"
       },
       "method": "Delete",
+      "basePath": "",
       "path": [
         {
           "DynamicObject": {

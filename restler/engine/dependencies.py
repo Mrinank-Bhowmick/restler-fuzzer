@@ -14,6 +14,9 @@ from multiprocessing.dummy import Pool as ThreadPool
 import utils.formatting as formatting
 from restler_settings import Settings
 
+class ResourceTypeQuotaExceededException(Exception):
+    pass
+
 threadLocal = threading.local()
 # Keep TLS tlb to enforce mutual exclusion when using >1 fuzzing jobs.
 threadLocal.tlb = {}
@@ -235,12 +238,13 @@ def set_saved_dynamic_objects():
 # 200 and 202 codes indicate that the DELETE request was successful
 # 204 and 404 indicate that the resource does not exist. This happens
 # when the resource has already been deleted during the fuzzing run
-DELETED_CODES = ['200', '202', '204', '404']
+DELETED_CODES = ['200', '204', '404']
+DELETED_CODES_ASYNC = ['202']
 
-class GarbageCollectorThread(threading.Thread):
+class GarbageCollector:
     """ Garbage collector class
     """
-    def __init__(self, req_collection, fuzzing_monitor, interval):
+    def __init__(self, req_collection, fuzzing_monitor):
         """ Uses requests from @param req_collection to garbage collect, i.e.,
         try to periodically try deleting dynamic objects.
 
@@ -248,17 +252,13 @@ class GarbageCollectorThread(threading.Thread):
         @type  req_collection: RequestCollection class object.
         @param fuzzing_monitor: The global monitor for the fuzzing run
         @type  fuzzing_monitor: FuzzingMonitor
-        @param interval: The interval after which to restart garbage collection.
-        @param interval: Int
 
         @return: None
         @rtype : None
 
         """
-        threading.Thread.__init__(self)
-
-        self._interval = interval
-        self._dyn_objects_cache_size = Settings().dyn_objects_cache_size
+        self._dyn_objects_cache_size = \
+            0 if Settings().run_gc_after_every_sequence else Settings().dyn_objects_cache_size
 
         self.req_collection = req_collection
         self.monitor = fuzzing_monitor
@@ -278,38 +278,69 @@ class GarbageCollectorThread(threading.Thread):
         # This is a buffer of all overflowing dynamic objects created during the
         # lifetime of fuzzing.
         self.overflowing = {}
+
+        # The deletions that have not yet completed, and require polling to get the final state
+        self.async_deletions = {}
+
+        # The number of failed deletions.
+        self.num_failed_deletions = 0
+
+        # Statistics on deleted objects
+        # Shows the error codes for DELETEs attempted per object type
+        self.gc_stats = {}
+
         self._finishing = False
+        self._created_network_log = False
         self._cleanup_event = threading.Event()
+        self._cleanup_done_event = threading.Event()
+        self._cleanup_done_event_timeout = 3600 # 1 hour
+
+    @property
+    def cleanup_event(self):
+        return self._cleanup_event
+
+    @property
+    def cleanup_done_event(self):
+        return self._cleanup_done_event
+
+    def clean_all_objects(self):
+        """Signals the event that triggers cleanup, and
+        waits for the done event."""
+        self.cleanup_event.set()
+        self.cleanup_done_event.wait(self._cleanup_done_event_timeout)
+        self.cleanup_done_event.clear()
 
     def run(self):
-        """ Thread entrance - periodically do garbage collection.
+        """ Do garbage collection.
 
         @return: None
         @rtype : None
 
         """
-        def _should_stop():
-            if self._finishing:
-                elapsed_time = time.time() - self._cleanup_start_time
-                return elapsed_time > self._max_cleanup_time or self._cache_empty()
+        if not self._created_network_log:
+            from utils.logger import create_network_log
+            from utils.logger import LOG_TYPE_GC
+            create_network_log(LOG_TYPE_GC)
+            self._created_network_log = True
+
+        try:
+            self.do_garbage_collection()
+        except Exception as error:
+            error_str = f"{formatting.timestamp()}: Exception during garbage collection: {error!s}"
+            print(error_str)
+            from utils.logger import garbage_collector_logging as CUSTOM_LOGGING
+            CUSTOM_LOGGING(error_str)
+            raise
+
+    def finish(self):
+        # Move the saved dynamic objects into the dynamic objects
+        # cache to be deleted
+        for name, val in self.saved_dyn_objects.items():
+            if name in self.dyn_objects_cache:
+                self.dyn_objects_cache[name].extend(val)
             else:
-                return False
-
-        from utils.logger import create_network_log
-        from utils.logger import LOG_TYPE_GC
-        create_network_log(LOG_TYPE_GC)
-
-        while not _should_stop():
-            # Sleep here for _interval unless the cleanup event has been set
-            self._cleanup_event.wait(self._interval)
-            try:
-                self.do_garbage_collection()
-            except Exception as error:
-                error_str = f"Exception during garbage collection: {error!s}"
-                print(error_str)
-                from utils.logger import garbage_collector_logging as CUSTOM_LOGGING
-                CUSTOM_LOGGING(error_str)
-                sys.exit(-1)
+                self.dyn_objects_cache[name] = val
+        self._dyn_objects_cache_size = 0
 
     def _cache_empty(self):
         """ Helper function that returns whether or not there are any more
@@ -321,35 +352,10 @@ class GarbageCollectorThread(threading.Thread):
         """
         for type in self._destructor_types:
             if len(self.overflowing[type]) > 0 or\
-                    len(self.dyn_objects_cache[type]) > 0:
+                    len(self.dyn_objects_cache[type]) > 0 or\
+                    len(self.async_deletions[type]) > 0:
                 return False
         return True
-
-    def finish(self, max_cleanup_time):
-        """ Begins the final cleanup of the garbage collector
-
-        @param max_cleanup_time: The amount of time to continue garbage
-                                 collection after this function call
-        @type  max_cleanup_time: Integer
-        @return: None
-        @rtype : None
-
-        """
-        # Move the saved dynamic objects into the dynamic objects
-        # cache to be deleted
-        for name, val in self.saved_dyn_objects.items():
-            if name in self.dyn_objects_cache:
-                self.dyn_objects_cache[name].extend(val)
-            else:
-                self.dyn_objects_cache[name] = val
-
-        self._finishing = True
-        self._interval = 0
-        self._dyn_objects_cache_size = 0
-        self._cleanup_start_time = time.time()
-        self._max_cleanup_time = max_cleanup_time
-        # Set the cleanup event flag to immediately stop the GC loop from waiting
-        self._cleanup_event.set()
 
     def do_garbage_collection(self):
         """ Implements the garbage collection logic.
@@ -394,6 +400,8 @@ class GarbageCollectorThread(threading.Thread):
         for object_type in destructors:
             if object_type not in self.overflowing:
                 self.overflowing[object_type] = []
+                self.async_deletions[object_type] = []
+                self.gc_stats[object_type] = {}
                 self._destructor_types.append(object_type)
             n_overflowing = len(self.dyn_objects_cache[object_type]) -\
                 self._dyn_objects_cache_size
@@ -417,10 +425,6 @@ class GarbageCollectorThread(threading.Thread):
         @type  overflowing: Dict
         @param destructors: The Request class objects required to delete.
         @type  destructors: Dict
-        @param max_aged_objects: Maximum number of objects we allow to age
-                                    and will retry to delete (since delete
-                                    is idempotent this is fine).
-        @type  max_aged_objects: Int
 
         @return: None
         @rtype : None
@@ -430,6 +434,8 @@ class GarbageCollectorThread(threading.Thread):
         aging here.
 
         """
+        from engine.core.async_request_utilities import try_async_poll
+
         if not self.overflowing:
             return
 
@@ -439,6 +445,92 @@ class GarbageCollectorThread(threading.Thread):
         from utils.logger import raw_network_logging as RAW_LOGGING
         from utils.logger import garbage_collector_logging as CUSTOM_LOGGING
         from engine.core import request_utilities
+
+        def update_gc_stats(status_code):
+            status_str = str(status_code)
+            if status_str not in self.gc_stats[type]:
+                self.gc_stats[type][status_str] = 0
+            self.gc_stats[type][status_str] += 1
+
+        def process_async_deletes():
+            async_deleted_list = []
+            # Try to async poll for 1 second, unless GC has been requested after every sequence.
+            # When GC runs after every sequence, complete clean-up is desired, so wait for the resource
+            # to be deleted for the full the async timeout.
+            async_timeout = 1.1
+            if Settings().run_gc_after_every_sequence:
+                # Wait until the async deletions have completed.
+                async_timeout = Settings().max_async_resource_creation_time
+
+            if self.async_deletions[type]:
+                CUSTOM_LOGGING("{}: Polling for status of garbage collection of * {} * objects".\
+                format(formatting.timestamp(), len(self.async_deletions[type])))
+
+            # Go through the polling requests from the previous time applying destructors
+            for value, (rendered_delete_request, response) in self.async_deletions[type]:
+
+                # Get the request used for polling the resource availability
+                responses_to_parse, resource_error, polling_attempted = try_async_poll(
+                    request_data=rendered_delete_request, response=response, max_async_wait_time=async_timeout,
+                    poll_delete_status=True)
+
+                if polling_attempted:
+                    status_code = None if not responses_to_parse else responses_to_parse[0].status_code
+                    if resource_error or status_code in DELETED_CODES:
+                        # The delete operation has finished.
+                        if status_code not in DELETED_CODES:
+                            # There was a resource error
+                            self.num_failed_deletions += 1
+                        update_gc_stats(status_code)
+                        async_deleted_list.append(value)
+                else:
+                    # Polling location was not found in the response.
+                    # Assume the object has been successfully deleted.
+                    async_deleted_list.append(value)
+                    update_gc_stats(response.status_code)
+            return async_deleted_list
+
+        def process_overflowing():
+            deleted_list = []
+            if self.overflowing[type]:
+                CUSTOM_LOGGING("{}: Trying garbage collection of * {} * objects".\
+                format(formatting.timestamp(), len(self.overflowing[type])))
+                CUSTOM_LOGGING(f"{type}: {self.overflowing[type]}")
+
+            # Iterate in reverse to give priority to the newest resources
+            for value in reversed(self.overflowing[type]):
+                rendered_data, _ , _, _ = destructor.\
+                    render_current(self.req_collection.candidate_values_pool)
+
+                # replace dynamic parameters
+                fully_rendered_data = str(rendered_data)
+                fully_rendered_data = fully_rendered_data.replace(RDELIM + type + RDELIM, value)
+
+                if fully_rendered_data:
+                    # Send the request and receive the response
+                    response = request_utilities.send_request_data(
+                        fully_rendered_data, req_timeout_sec=Settings().max_request_execution_time,
+                        reconnect=Settings().reconnect_on_every_request,
+                        http_sock=gc_sock)
+
+                    success = response.status_code is not None
+                    if success:
+                        self.monitor.increment_requests_count('gc')
+                    else:
+                        RAW_LOGGING(f"GC request failed: {response.to_str}")
+
+                    # Check to see if the DELETE operation is complete
+                    update_gc_stats(response.status_code)
+                    if response.status_code in DELETED_CODES:
+                        deleted_list.append(value)
+                    if response.status_code in DELETED_CODES_ASYNC:
+                        # Note: if the DELETE returned a 202, the final status of the deletion must be obtained
+                        # by polling.  However, do not wait for each individual DELETE to complete,
+                        # since this may stall the GC.  Instead, record the polling location and check the status
+                        # on the next collection.
+                        self.async_deletions[type].append((value, (fully_rendered_data, response)))
+                        deleted_list.append(value)
+            return deleted_list
 
         try:
             gc_sock = threadLocal.gc_sock
@@ -455,44 +547,100 @@ class GarbageCollectorThread(threading.Thread):
         # remaining objects.
         for type in destructors:
             destructor = destructors[type]
-            deleted_list = []
-
-            if self.overflowing[type]:
-                CUSTOM_LOGGING("{}: Trying garbage collection of * {} * objects".\
-                format(formatting.timestamp(), len(self.overflowing[type])))
-                CUSTOM_LOGGING(f"{type}: {self.overflowing[type]}")
-
-            # Iterate in reverse to give priority to newest resources
-            for value in reversed(self.overflowing[type]):
-                rendered_data, _ , _ = destructor.\
-                    render_current(self.req_collection.candidate_values_pool)
-
-                # replace dynamic parameters
-                fully_rendered_data = str(rendered_data)
-                fully_rendered_data = fully_rendered_data.replace(RDELIM + type + RDELIM, value)
-
-                if fully_rendered_data:
-                    # Send the request and receive the response
-
-                    response = request_utilities.send_request_data(
-                        fully_rendered_data, req_timeout_sec=Settings().max_request_execution_time,
-                        reconnect=Settings().reconnect_on_every_request,
-                        http_sock=gc_sock)
-
-                    success = response.status_code is not None
-                    if success:
-                        self.monitor.increment_requests_count('gc')
-                    else:
-                        RAW_LOGGING(f"GC request failed: {response.to_str}")
-
-                    # Check to see if the DELETE operation is complete
-                    try:
-                        if response.status_code in DELETED_CODES:
-                            deleted_list.append(value)
-                    except Exception:
-                        pass
+            deleted_list = process_overflowing()
+            async_deleted_list = process_async_deletes()
 
             # Remove deleted items from the to-delete cache
             for value in deleted_list:
                 self.overflowing[type].remove(value)
-            self.overflowing[type] = self.overflowing[type][-max_aged_objects:]
+
+            # Remove the items that failed to be deleted based on their async status
+            self.async_deletions[type] =\
+                [(val, x) for (val, x) in self.async_deletions[type] if val not in async_deleted_list]
+
+            # Check how many objects are left in the overflowing list
+            # If there are more than the allowed number of objects, terminate the run
+            if Settings().max_objects_per_resource_type is not None:
+                max_objects_per_resource_type = Settings().max_objects_per_resource_type
+                obj_count = len(self.overflowing[type]) + len(self.async_deletions[type]) + self.num_failed_deletions
+                if obj_count > max_objects_per_resource_type:
+                    raise ResourceTypeQuotaExceededException(f"Limit exceeded for objects of type {type} "
+                                                             f"({obj_count} > {max_objects_per_resource_type}).")
+                # Since resource limits are being tracked, do not remove any objects from overflowing
+            else:
+                self.overflowing[type] = self.overflowing[type][-max_aged_objects:]
+                self.async_deletions[type] = self.async_deletions[type][-max_aged_objects:]
+
+
+class GarbageCollectorThread(threading.Thread):
+    """ Garbage collector thread class
+    """
+    def __init__(self, garbage_collector, interval):
+        """ Uses requests from @param req_collection to garbage collect, i.e.,
+        try to periodically try deleting dynamic objects.
+
+        @param garbage_collector: The garbage collector that will be used to clean up objects.
+        @type  garbage_collector: GarbageCollector class object.
+        @param interval: The interval after which to restart garbage collection.
+        @param interval: Int
+
+        @return: None
+        @rtype : None
+
+        """
+        threading.Thread.__init__(self)
+
+        self._garbage_collector = garbage_collector
+        self._finishing = False
+        self._interval = interval
+
+    def run(self):
+        """ Thread entrance - periodically do garbage collection.
+
+        @return: None
+        @rtype : None
+
+        """
+        def _should_stop():
+            if self._finishing:
+                elapsed_time = time.time() - self._cleanup_start_time
+                return elapsed_time > self._max_cleanup_time or self._garbage_collector._cache_empty()
+            else:
+                return False
+
+        while not _should_stop():
+            # Sleep here for _interval unless the cleanup event has been set
+            self._garbage_collector.cleanup_event.wait(self._interval)
+            try:
+                self._garbage_collector.run()
+            except Exception as error:
+                # Set the cleanup event timeout to a short interval so the Fuzzer thread does not wait
+                # after the GC thread is terminated
+                self._garbage_collector._cleanup_done_event_timeout = 1
+                raise
+            finally:
+                self._garbage_collector.cleanup_event.clear()
+                self._garbage_collector.cleanup_done_event.set()
+
+    def finish(self, max_cleanup_time):
+        """ Begins the final cleanup of the garbage collector
+
+        @param max_cleanup_time: The amount of time to continue garbage
+                                 collection after this function call
+        @type  max_cleanup_time: Integer
+        @return: None
+        @rtype : None
+
+        """
+        self._garbage_collector.finish()
+
+        # The first cycle of garbage collection will run immediately when finishing GC.
+        # Set subsequent ones to run at 10 second interval, since the only remaining resources
+        # will be async deletions, and they should be attempted with a polling interval
+        self._interval = 10
+        self._cleanup_start_time = time.time()
+        self._finishing = True
+        self._max_cleanup_time = max_cleanup_time
+        # Set the cleanup event flag to immediately stop the GC loop from waiting
+        self._garbage_collector.cleanup_event.set()
+

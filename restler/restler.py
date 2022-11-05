@@ -12,16 +12,16 @@ from subprocess import call
 import os
 import sys
 import signal
-import time
 import json
 import shutil
 import argparse
 import checkers
 import restler_settings
-import atexit
-from threading import Thread
+import traceback
 
 import utils.logger as logger
+import utils.formatting as formatting
+
 import engine.bug_bucketing as bug_bucketing
 import engine.dependencies as dependencies
 import engine.core.preprocessing as preprocessing
@@ -35,6 +35,7 @@ from engine.errors import InvalidDictionaryException
 from engine.errors import NoTokenSpecifiedException
 from engine.primitives import InvalidDictPrimitiveException
 from engine.primitives import UnsupportedPrimitiveException
+from restler_settings import Settings
 
 MANAGER_HANDLE = None
 
@@ -60,7 +61,7 @@ def import_grammar(path):
 
     return req_collection
 
-def get_checker_list(req_collection, fuzzing_requests, enable_list, disable_list, set_enable_first, custom_checkers, enable_default_checkers=True):
+def get_checker_list(req_collection, fuzzing_requests, enable_list, disable_list, set_enable_first, custom_checkers):
     """ Initializes all of the checkers, sets the appropriate checkers
     as enabled/disabled, and returns a list of checker objects
 
@@ -99,10 +100,6 @@ def get_checker_list(req_collection, fuzzing_requests, enable_list, disable_list
     @type  set_enable_first: Bool
     @param custom_checkers: List of paths to custom checker python files
     @type  custom_checkers: List[str]
-    @param enable_default_checkers: If set to False, each checker will be disabled by default,
-                                    otherwise, checkers will be enabled/disabled based on their
-                                    default settings.
-    @type  enable_default_checkers: Bool
 
     @return: List of Checker objects to apply
     @rtype : List[Checker]
@@ -111,9 +108,10 @@ def get_checker_list(req_collection, fuzzing_requests, enable_list, disable_list
     # Add any custom checkers
     for custom_checker_file_path in custom_checkers:
         try:
-            utils.import_utilities.load_module('custom_checkers', custom_checker_file_path)
+            import_utilities.load_module('custom_checkers', custom_checker_file_path)
             logger.write_to_main(f"Loaded custom checker from {custom_checker_file_path}", print_to_console=True)
         except Exception as err:
+            traceback.print_exc()
             logger.write_to_main(f"Failed to load custom checker {custom_checker_file_path}: {err!s}", print_to_console=True)
             sys.exit(-1)
 
@@ -151,8 +149,6 @@ def get_checker_list(req_collection, fuzzing_requests, enable_list, disable_list
     # Iterate through each checker and search for its friendly name
     # in each list of enabled/disabled
     for checker in available_checkers:
-        if not enable_default_checkers:
-            checker.enabled = False
         if checker.friendly_name in first_list:
             checker.enabled = first_enable
         if checker.friendly_name in second_list:
@@ -430,7 +426,13 @@ if __name__ == '__main__':
             }
         )
     else:
-        req_collection.remove_authentication_tokens()
+        req_collection.candidate_values_pool.set_candidate_values(
+            {
+                'restler_refreshable_authentication_token':
+                    {
+                    }
+            }
+        )
 
     # Initialize the fuzzing monitor
     monitor = fuzzing_monitor.FuzzingMonitor()
@@ -481,7 +483,7 @@ if __name__ == '__main__':
         set_enable_first = args.enable_checkers is not None
 
     checkers = get_checker_list(req_collection, fuzzing_requests, args.enable_checkers or [], args.disable_checkers or [],\
-        set_enable_first, settings.custom_checkers, enable_default_checkers=args.fuzzing_mode != 'directed-smoke-test')
+        set_enable_first, settings.custom_checkers)
 
     # Initialize request count for each checker
     for checker in checkers:
@@ -519,20 +521,24 @@ if __name__ == '__main__':
     else:
         logger.write_to_main(f"Grammar schema file '{grammar_path}' does not exist.", print_to_console=True)
 
-    # Start fuzzing
-    fuzz_thread = fuzzer.FuzzingThread(fuzzing_requests, checkers, args.fuzzing_jobs)
-    fuzz_thread.name = 'Fuzzer'
-    fuzz_thread.daemon = True
-    fuzz_thread.start()
-
+    # Set up garbage collection
     gc_thread = None
-    # Start the GC thread if specified
-    if args.garbage_collection_interval:
-        print(f"Initializing: Garbage collection every {settings.garbage_collection_interval} seconds.")
-        gc_thread = dependencies.GarbageCollectorThread(req_collection, monitor, settings.garbage_collection_interval)
+    garbage_collector = dependencies.GarbageCollector(req_collection, monitor)
+
+    if args.garbage_collection_interval or Settings().run_gc_after_every_sequence:
+        gc_message = "after every test sequence. " \
+                        if Settings().run_gc_after_every_sequence else f"every {settings.garbage_collection_interval} seconds."
+        print(f"{formatting.timestamp()}: Initializing: Garbage collection {gc_message}")
+        gc_thread = dependencies.GarbageCollectorThread(garbage_collector, settings.garbage_collection_interval)
         gc_thread.name = 'Garbage Collector'
         gc_thread.daemon = True
         gc_thread.start()
+
+    # Start fuzzing
+    fuzz_thread = fuzzer.FuzzingThread(fuzzing_requests, checkers, args.fuzzing_jobs, garbage_collector)
+    fuzz_thread.name = 'Fuzzer'
+    fuzz_thread.daemon = True
+    fuzz_thread.start()
 
     THREAD_JOIN_WAIT_TIME_SECONDS = 1
     # Wait for the fuzzing job to end before continuing.
@@ -542,7 +548,7 @@ if __name__ == '__main__':
     while fuzz_thread.is_alive():
         if gc_thread and not gc_thread.is_alive():
             logger.write_to_main(
-                "Garbage collector thread has terminated prematurely", print_to_console=True
+                f"{formatting.timestamp()}: Garbage collector thread has terminated prematurely", print_to_console=True
             )
             # Terminate the fuzzing thread
             monitor.terminate_fuzzing()
@@ -562,8 +568,8 @@ if __name__ == '__main__':
 
     # If garbage collection is on, deallocate everything possible.
     if gc_thread:
-        print("Terminating garbage collection. Waiting for max {} seconds.".\
-              format(settings.garbage_collector_cleanup_time))
+        print(f"{formatting.timestamp()}: Terminating garbage collection. "
+              f"Waiting for max {settings.garbage_collector_cleanup_time} seconds. ")
         gc_thread.finish(settings.garbage_collector_cleanup_time)
         # Wait for GC to complete
         # Loop in order to enable the signal handler to run,
@@ -573,6 +579,9 @@ if __name__ == '__main__':
 
     # Print the end of the run generation stats
     logger.print_generation_stats(req_collection, monitor, None, final=True)
+
+    # Print the garbage collection stats
+    logger.print_gc_summary(garbage_collector)
 
     if fuzz_thread.exception is not None:
         print(fuzz_thread.exception)

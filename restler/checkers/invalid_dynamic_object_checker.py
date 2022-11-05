@@ -58,7 +58,8 @@ class InvalidDynamicObjectChecker(CheckerBase):
         InvalidDynamicObjectChecker.generation_executed_requests[generation].add(last_request.hex_definition)
 
         # Get the current rendering of the sequence, which will be the valid rendering of the last request
-        last_rendering, last_request_parser, tracked_parameters = last_request.render_current(self._req_collection.candidate_values_pool)
+        last_rendering, last_request_parser, tracked_parameters, updated_writer_variables =\
+            last_request.render_current(self._req_collection.candidate_values_pool)
 
         # Execute the sequence up until the last request
         new_seq = self._execute_start_of_sequence()
@@ -70,6 +71,9 @@ class InvalidDynamicObjectChecker(CheckerBase):
         for data in self._prepare_invalid_requests(last_rendering):
             self._checker_log.checker_print(repr(data))
             response = self._send_request(last_request_parser, data)
+            if response.has_valid_code():
+                for name,v in updated_writer_variables.items():
+                    dependencies.set_variable(name, v)
             request_utilities.call_response_parser(last_request_parser, response)
             if response and self._rule_violation(new_seq, response):
                 # Append the data that we just sent to the sequence's sent list
@@ -78,24 +82,6 @@ class InvalidDynamicObjectChecker(CheckerBase):
                 self._print_suspect_sequence(new_seq, response)
 
 
-    def _execute_start_of_sequence(self):
-        """ Send all requests in the sequence up until the last request
-
-        @return: Sequence of n predecessor requests send to server
-        @rtype : Sequence
-
-        """
-        RAW_LOGGING("Re-rendering and sending start of sequence")
-        new_seq = sequences.Sequence([])
-        for request in self._sequence.requests[:-1]:
-            new_seq = new_seq + sequences.Sequence(request)
-            response, _ = self._render_and_send_data(new_seq, request)
-            # Check to make sure a bug wasn't uncovered while executing the sequence
-            if response and response.has_bug_code():
-                self._print_suspect_sequence(new_seq, response)
-                BugBuckets.Instance().update_bug_buckets(new_seq, response.status_code, origin=self.__class__.__name__)
-
-        return new_seq
 
     def _prepare_invalid_requests(self, data):
         """ Prepares requests with invalid dynamic objects.

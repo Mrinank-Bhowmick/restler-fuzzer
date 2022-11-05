@@ -321,7 +321,7 @@ module private Parameters =
                                 else
                                     let parameterGrammarElement =
                                         generateGrammarElementForSchema declaredParameter.ActualSchema
-                                                                        (Some payloadValue, false)
+                                                                        (Some payloadValue, true)
                                                                         (trackParameters, None)
                                                                         (declaredParameter.IsRequired, (parameterIsReadOnly declaredParameter))
                                                                         []
@@ -339,30 +339,33 @@ module private Parameters =
     // The priority is:
     // - first, check the 'Example' property
     // - then, check the 'Examples' property
+    // - then, check the schema for the 'Example' or 'Examples' property
+    // TODO: support getting multiple examples, so RESTler can use all available examples
     let getExamplesFromParameter (p:OpenApiParameter) =
-        let schemaExample =
+        let getSchemaExample() =
             if isNull p.Schema then None
             else
-                SchemaUtilities.tryGetSchemaExampleAsString p.Schema
-        match schemaExample with
-        | Some e ->
-            Some e
-        | None ->
-            if not (isNull p.Examples) then
+                SchemaUtilities.tryGetSchemaExampleAsJToken p.Schema
+
+        let getParameterExample() = 
+            // Get the example from p.Example
+            match SchemaUtilities.tryGetSchemaExampleAsJToken (p :> NJsonSchema.JsonSchema) with
+            | Some ext -> Some ext
+            | None when not (isNull p.Examples) -> 
+                // Get the value from p.Examples
                 if p.Examples.Count > 0 then
                     let firstExample = p.Examples.First()
-                    let exValue =
-                        let v = firstExample.Value.Value.ToString()
-                        if p.Type = NJsonSchema.JsonObjectType.Array ||
-                            p.Type = NJsonSchema.JsonObjectType.Object then
-                            v
-                        else
-                            sprintf "\"%s\"" v
-                    Some exValue
+                    let v = firstExample.Value.Value.ToString()
+                    v |> SchemaUtilities.formatExampleValue |> SchemaUtilities.tryParseJToken
                 else
                     None
-            else
-                None
+            | _ -> None
+            
+        match getParameterExample() with
+        | Some parameterExample ->  
+            Some parameterExample
+        | None ->
+            getSchemaExample()
 
     let getSpecParameters (swaggerMethodDefinition:OpenApiOperation)
                           (parameterKind:NSwag.OpenApiParameterKind) =
@@ -491,10 +494,7 @@ module private Parameters =
                 Some (parameterList
                       |> Seq.map (fun p ->
                                     let specExampleValue =
-                                        match getExamplesFromParameter p with
-                                        | None -> None
-                                        | Some exValue ->
-                                            SchemaUtilities.tryParseJToken exValue
+                                         getExamplesFromParameter p 
 
                                     let parameterPayload = generateGrammarElementForSchema
                                                                 p.ActualSchema
@@ -565,7 +565,7 @@ module private Parameters =
             if not (isNull swaggerMethodDefinition.RequestBody) &&
                 not (isNull swaggerMethodDefinition.RequestBody.Content) then
                 let content =
-                    swaggerMethodDefinition.RequestBody.Content |> Seq.tryFind (fun x -> x.Key = "application/json")
+                    swaggerMethodDefinition.RequestBody.Content |> Seq.tryFind (fun x -> x.Key = "application/json" || x.Key = "*/*")
                 // If the schema is null, issue a warning.
                 match content with
                 | Some c ->
@@ -1324,6 +1324,14 @@ let generateRequestGrammar (swaggerDocs:Types.ApiSpecFuzzingConfig list)
 
     logTimingInfo "Generating request primitives..."
 
+       
+    // The dependencies above are analyzed on a per-request basis.
+    // This can lead to missing dependencies (for example, an input producer writer 
+    // may be missing because the same parameter already refers to a reader). 
+    // As a workaround, the function below handles such issues by finding and fixing up the
+    // problematic cases.
+    let dependenciesIndex, orderingConstraints = Restler.Dependencies.mergeDynamicObjects dependenciesIndex orderingConstraints
+
     let dependencies =
         dependenciesIndex
         |> Seq.map (fun kvp -> kvp.Value)
@@ -1332,7 +1340,19 @@ let generateRequestGrammar (swaggerDocs:Types.ApiSpecFuzzingConfig list)
 
     let dependencyInfo = getResponseParsers dependencies orderingConstraints
 
-    let basePath = swaggerDocs.[0].swaggerDoc.BasePath
+    let basePath = 
+        // Remove the ending slash if present, since a static slash will
+        // be inserted in the grammar
+        // Note: this code is not sufficient, and the same logic must be added in the engine,
+        // since the user may specify their own base path through a custom payload.
+        // However, this is included here as well so reading the grammar is not confusing and for any
+        // other tools that may process the grammar separately from the engine.
+        let bp = swaggerDocs.[0].swaggerDoc.BasePath 
+        if String.IsNullOrEmpty bp then ""
+        elif bp.EndsWith("/") then
+            bp.[0..bp.Length-2]
+        else
+            bp
     let host = swaggerDocs.[0].swaggerDoc.Host
 
     // Get the request primitives for each request

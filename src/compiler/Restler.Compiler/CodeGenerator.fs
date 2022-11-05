@@ -51,7 +51,7 @@ module Types =
         | Restler_custom_payload_header of string * DynamicObjectWriter option
         | Restler_custom_payload_query of string * DynamicObjectWriter option
         /// (Payload name, dynamic object writer name)
-        | Restler_custom_payload_uuid4_suffix of string * DynamicObjectWriter option
+        | Restler_custom_payload_uuid4_suffix of string * bool * DynamicObjectWriter option
         | Restler_refreshable_authentication_token of string
         | Restler_basepath of string
         | Shadow_values of string
@@ -118,7 +118,7 @@ let rec getRestlerPythonPayload (payload:FuzzingPayload) (isQuoted:bool) : Reque
             | CustomPayloadType.String ->
                 Restler_custom_payload ({ defaultValue = c.payloadValue ; isQuoted = isQuoted ; exampleValue = None ; trackedParameterName = None }, dynamicObject)
             | CustomPayloadType.UuidSuffix ->
-                Restler_custom_payload_uuid4_suffix (c.payloadValue, dynamicObject)
+                Restler_custom_payload_uuid4_suffix (c.payloadValue, isQuoted, dynamicObject)
             | CustomPayloadType.Header ->
                 Restler_custom_payload_header (c.payloadValue, dynamicObject)
             | CustomPayloadType.Query ->
@@ -335,7 +335,11 @@ let generatePythonParameter includeOptionalParameters parameterSource parameterK
             | PrimitiveType.Number ->
                 false
 
-        if p.isRequired || parameterSource = ParameterPayloadSource.Examples || includeOptionalParameters then
+        let includeProperty = 
+            // Exclude 'readonly' parameters
+            not p.isReadOnly && (p.isRequired || includeOptionalParameters)
+        // Parameters from an example payload are always included
+        if parameterSource = ParameterPayloadSource.Examples || includeProperty then
             let nameSeq =
                 if String.IsNullOrEmpty p.name then
                     if level = 0 && parameterKind = ParameterKind.Query then
@@ -350,12 +354,12 @@ let generatePythonParameter includeOptionalParameters parameterSource parameterK
             let needQuotes, isFuzzable, isDynamicObject =
                 match p.payload with
                 | FuzzingPayload.Custom c ->
-                    let isFuzzable = (c.payloadType = CustomPayloadType.String)
+                    let isFuzzable = true
                     // 'needQuotes' must be based on the underlying type of the payload.
                     let needQuotes =
                         (not c.isObject) &&
                         (isPrimitiveTypeQuoted c.primitiveType false)
-                    needQuotes, isFuzzable, false
+                    needQuotes, isFuzzable, false 
                 | FuzzingPayload.Constant (PrimitiveType.String, s) ->
                     // TODO: improve the metadata of FuzzingPayload.Constant to capture whether
                     // the constant represents an object,
@@ -410,7 +414,11 @@ let generatePythonParameter includeOptionalParameters parameterSource parameterK
             []
 
     let visitInner level (p:InnerProperty) (innerProperties: RequestPrimitiveType list seq) =
-        if p.isRequired || includeOptionalParameters then
+        let includeProperty = 
+            // Exclude 'readonly' parameters
+            not p.isReadOnly && (p.isRequired || includeOptionalParameters)
+        // Parameters from an example payload are always included
+        if parameterSource = ParameterPayloadSource.Examples || includeProperty then
             // Check for the custom payload
             let nameAndCustomPayloadSeq =
                 match p.payload with
@@ -688,9 +696,10 @@ let generatePythonFromRequest (request:Request) includeOptionalParameters mergeS
                             [parameterList ; currentPList] |> Seq.concat)
                         Seq.empty
 
-    let getParameterListPayload (queryOrBodyParameters:(ParameterPayloadSource * RequestParametersPayload) list) =
-        let payloadSource, declaredPayload = getParameterPayload queryOrBodyParameters
-        let injectedPayload = getCustomParameterPayload queryOrBodyParameters
+    /// Gets the parameter list payload for query, header, or body parameters
+    let getParameterListPayload (parameters:(ParameterPayloadSource * RequestParametersPayload) list) =
+        let payloadSource, declaredPayload = getParameterPayload parameters
+        let injectedPayload = getCustomParameterPayload parameters
         payloadSource, ParameterList ([declaredPayload ; injectedPayload] |> Seq.concat)
 
     let getExamplePayload (queryOrBodyParameters:(ParameterPayloadSource * RequestParametersPayload) list) =
@@ -1057,8 +1066,8 @@ let getRequests(requests:Request list) includeOptionalParameters =
                 else s, "'"
             // Special case already escaped quoted strings (this will be the case for example values).
             // Assume the entire string is quoted in this case.
-            else if s.StartsWith("\\\"") then
-                s, "\""
+            else if s.Contains("\\\"") then
+                s, "\"\"\""
             else if s.Contains("\"") then
                 s.Replace("\"", "\\\""), "\""
             else s, "\""
@@ -1191,10 +1200,11 @@ let getRequests(requests:Request list) includeOptionalParameters =
                         p.defaultValue
                         (if p.isQuoted then "True" else "False")
                         (formatDynamicObjectVariable dynamicObject)
-            | Restler_custom_payload_uuid4_suffix (p, dynamicObject) ->
-                sprintf "primitives.restler_custom_payload_uuid4_suffix(\"%s\"%s)"
+            | Restler_custom_payload_uuid4_suffix (p, isQuoted, dynamicObject) ->
+                sprintf "primitives.restler_custom_payload_uuid4_suffix(\"%s\"%s, quoted=%s)"
                         p
                         (formatDynamicObjectVariable dynamicObject)
+                        (if isQuoted then "True" else "False")
             | Restler_custom_payload_header (p, dynamicObject) ->
                 sprintf "primitives.restler_custom_payload_header(\"%s\"%s)"
                         p

@@ -1,7 +1,7 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>netcoreapp5.0</TargetFramework>
+    <TargetFramework>net6.0</TargetFramework>
     <NoWarn>NU1603;FS0988</NoWarn>
     <DisableImplicitNuGetFallbackFolder>true</DisableImplicitNuGetFallbackFolder>
   </PropertyGroup>
@@ -34,7 +34,13 @@
     <Content Include="baselines\dependencyTests\path_annotation_grammar.py">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
-    <Content Include="baselines\schemaTests\xMsPaths_grammar.py">
+	  <Content Include="baselines\dependencyTests\soft_delete_test_grammar1.py">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	  </Content>
+	  <Content Include="baselines\dependencyTests\soft_delete_test_grammar2.py">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	  </Content>
+	  <Content Include="baselines\schemaTests\xMsPaths_grammar.py">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="baselines\schemaTests\xMsPaths_grammar.json">
@@ -175,6 +181,9 @@
     <Content Include="swagger\schemaTests\openapi3_requestbody.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+	  <Content Include="swagger\schemaTests\openapi3_examples.json">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	  </Content>
 
     <Content Include="swagger\schemaTests\xMsPaths_annotations.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
@@ -207,6 +216,15 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
 	  <Content Include="swagger\DependencyTests\simple_crud_api_annotations.json">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	  </Content>
+    <Content Include="swagger\DependencyTests\simple_api_soft_delete.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+	  <Content Include="swagger\DependencyTests\simple_api_soft_delete_annotations1.json">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	  </Content>
+	  <Content Include="swagger\DependencyTests\simple_api_soft_delete_annotations2.json">
 		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
 	  </Content>
 	  <Content Include="swagger\DependencyTests\ordering_test.json">
@@ -362,14 +380,15 @@
     </Content>
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="Microsoft.FSharpLu" Version="0.11.6" />
-    <PackageReference Include="Microsoft.FSharpLu.Json" Version="0.11.6" />
-    <PackageReference Include="Newtonsoft.Json" Version="11.0.2" />
-    <PackageReference Include="NJsonSchema" Version="10.0.27" />
-    <PackageReference Include="NSwag.Core" Version="13.1.3" />
-    <PackageReference Include="xunit" Version="2.4.1" />
-    <PackageReference Include="xunit.runner.console" Version="2.4.1">
-      <PrivateAssets>all</PrivateAssets>
+    <PackageReference Include="Microsoft.FSharpLu" Version="0.11.7" />
+    <PackageReference Include="Microsoft.FSharpLu.Json" Version="0.11.7" />
+	  <PackageReference Include="Newtonsoft.Json" Version="13.0.1" />
+	  <PackageReference Include="NJsonSchema" Version="10.7.2" />
+	  <PackageReference Include="NSwag.Core" Version="13.16.1" />
+	  <PackageReference Include="xunit" Version="2.4.1" />
+	  <PackageReference Include="Microsoft.net.test.sdk" Version="16.9.1"/>
+	  <PackageReference Include="xunit.runner.console" Version="2.4.1" >
+			  <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
     <PackageReference Include="xunit.runner.visualstudio" Version="2.4.1">

@@ -22,9 +22,9 @@ from engine.transport_layer.messaging import UTF8
 from engine.transport_layer.messaging import HttpSock
 
 last_refresh = 0
-NO_TOKEN_SPECIFIED = 'NO-TOKEN-SPECIFIED'
+NO_TOKEN_SPECIFIED = 'NO-TOKEN-SPECIFIED\r\n'
 latest_token_value = NO_TOKEN_SPECIFIED
-NO_SHADOW_TOKEN_SPECIFIED = 'NO-SHADOW-TOKEN-SPECIFIED'
+NO_SHADOW_TOKEN_SPECIFIED = 'NO-SHADOW-TOKEN-SPECIFIED\r\n'
 latest_shadow_token_value = NO_SHADOW_TOKEN_SPECIFIED
 
 HOST_PREFIX = 'Host: '
@@ -74,8 +74,9 @@ def execute_token_refresh_cmd(cmd):
             else:
                 cmd_result = subprocess.getoutput([cmd])
 
-            _, latest_token_value, latest_shadow_token_value = parse_authentication_tokens(cmd_result)
             _RAW_LOGGING(f"New value: {cmd_result}")
+            _, latest_token_value, latest_shadow_token_value = parse_authentication_tokens(cmd_result)
+            _RAW_LOGGING(f"Successfully obtained the latest token")
             break
         except subprocess.CalledProcessError:
             error_str = f"Authentication failed when refreshing token:\n\nCommand that failed: \n{cmd}"
@@ -185,6 +186,7 @@ def resolve_dynamic_primitives(values, candidate_values_pool):
     @return: List of string of primitive type payloads for which any dynamic
                 primitive (e.g., uuid4) with be substituted with a fresh and
                 unique value.
+            Note: this function will also update the values in place as a side effect.
     @rtype : List
 
     """
@@ -254,14 +256,19 @@ def resolve_dynamic_primitives(values, candidate_values_pool):
             )
             if not isinstance(token_dict, dict):
                 raise Exception("Refreshable token was not specified as a setting, but a request was expecting it.")
-            token_refresh_interval = token_dict['token_refresh_interval']
-            token_refresh_cmd = token_dict['token_refresh_cmd']
-            if int(time.time()) - last_refresh > token_refresh_interval:
-                execute_token_refresh_cmd(token_refresh_cmd)
-                last_refresh = int(time.time())
-                #print("-{}-\n-{}-".format(repr(latest_token_value),
-                #                          repr(latest_shadow_token_value)))
-            values[i] = latest_token_value
+            if token_dict:
+                token_refresh_interval = token_dict['token_refresh_interval']
+                token_refresh_cmd = token_dict['token_refresh_cmd']
+                if int(time.time()) - last_refresh > token_refresh_interval:
+                    execute_token_refresh_cmd(token_refresh_cmd)
+                    last_refresh = int(time.time())
+                    #print("-{}-\n-{}-".format(repr(latest_token_value),
+                    #                          repr(latest_shadow_token_value)))
+                values[i] = latest_token_value
+            else:
+                # If the dictionary is empty, there is no authentication specified.
+                # Simply return the empty string.
+                values[i] = ""
 
     return values
 
